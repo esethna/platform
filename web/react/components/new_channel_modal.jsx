@@ -151,7 +151,7 @@ export default class NewChannelModal extends React.Component {
                                         tabIndex='2'
                                     />
                                     <p className='input__help'>
-                                        {`Describe how this ${channelTerm} should be used.`}
+                                        {`Describe how this ${channelTerm} should be used. This text appears in the channel list in the "More..." menu and helps others decide whether to join.`}
                                     </p>
                                     {serverError}
                                 </div>
