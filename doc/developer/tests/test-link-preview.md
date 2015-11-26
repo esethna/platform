@@ -16,7 +16,7 @@ Post the following links one per message in the above variations:
 Twitter Link Preview: 
 https://twitter.com/mattermosthq/status/664928489078820865
 
-Vine: 
+Vine:  
 https://vine.co/v/eDeVgbFrt9L
 
 Wikipedia
