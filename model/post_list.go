@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -13,8 +13,27 @@ type PostList struct {
 	Posts map[string]*Post `json:"posts"`
 }
 
+func NewPostList() *PostList {
+	return &PostList{
+		Order: make([]string, 0),
+		Posts: make(map[string]*Post),
+	}
+}
+
+func (o *PostList) StripActionIntegrations() {
+	posts := o.Posts
+	o.Posts = make(map[string]*Post)
+	for id, post := range posts {
+		pcopy := *post
+		pcopy.StripActionIntegrations()
+		o.Posts[id] = &pcopy
+	}
+}
+
 func (o *PostList) ToJson() string {
-	b, err := json.Marshal(o)
+	copy := *o
+	copy.StripActionIntegrations()
+	b, err := json.Marshal(&copy)
 	if err != nil {
 		return ""
 	} else {
@@ -54,6 +73,15 @@ func (o *PostList) AddPost(post *Post) {
 	o.Posts[post.Id] = post
 }
 
+func (o *PostList) Extend(other *PostList) {
+	for _, postId := range other.Order {
+		if _, ok := o.Posts[postId]; !ok {
+			o.AddPost(other.Posts[postId])
+			o.AddOrder(postId)
+		}
+	}
+}
+
 func (o *PostList) Etag() string {
 
 	id := "0"
@@ -63,10 +91,18 @@ func (o *PostList) Etag() string {
 		if v.UpdateAt > t {
 			t = v.UpdateAt
 			id = v.Id
+		} else if v.UpdateAt == t && v.Id > id {
+			t = v.UpdateAt
+			id = v.Id
 		}
 	}
 
-	return Etag(id, t)
+	orderId := ""
+	if len(o.Order) > 0 {
+		orderId = o.Order[0]
+	}
+
+	return Etag(orderId, id, t)
 }
 
 func (o *PostList) IsChannelId(channelId string) bool {

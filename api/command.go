@@ -1,481 +1,292 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
 
 import (
+	"io/ioutil"
 	"net/http"
-	"strconv"
 	"strings"
-	"time"
 
-	l4g "code.google.com/p/log4go"
-	"github.com/gorilla/mux"
-	"github.com/mattermost/platform/model"
-	"github.com/mattermost/platform/utils"
+	l4g "github.com/alecthomas/log4go"
+
+	"github.com/mattermost/mattermost-server/app"
+	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/utils"
 )
 
-type commandHandler func(c *Context, command *model.Command) bool
+func InitCommand() {
+	l4g.Debug(utils.T("api.command.init.debug"))
 
-var commands = []commandHandler{
-	logoutCommand,
-	joinCommand,
-	loadTestCommand,
-	echoCommand,
+	BaseRoutes.Commands.Handle("/execute", ApiUserRequired(executeCommand)).Methods("POST")
+	BaseRoutes.Commands.Handle("/list", ApiUserRequired(listCommands)).Methods("GET")
+
+	BaseRoutes.Commands.Handle("/create", ApiUserRequired(createCommand)).Methods("POST")
+	BaseRoutes.Commands.Handle("/update", ApiUserRequired(updateCommand)).Methods("POST")
+	BaseRoutes.Commands.Handle("/list_team_commands", ApiUserRequired(listTeamCommands)).Methods("GET")
+	BaseRoutes.Commands.Handle("/regen_token", ApiUserRequired(regenCommandToken)).Methods("POST")
+	BaseRoutes.Commands.Handle("/delete", ApiUserRequired(deleteCommand)).Methods("POST")
+
+	BaseRoutes.Teams.Handle("/command_test", ApiAppHandler(testCommand)).Methods("POST")
+	BaseRoutes.Teams.Handle("/command_test", ApiAppHandler(testCommand)).Methods("GET")
+	BaseRoutes.Teams.Handle("/command_test_e", ApiAppHandler(testEphemeralCommand)).Methods("POST")
+	BaseRoutes.Teams.Handle("/command_test_e", ApiAppHandler(testEphemeralCommand)).Methods("GET")
 }
 
-var echoSem chan bool
+func listCommands(c *Context, w http.ResponseWriter, r *http.Request) {
+	commands, err := c.App.ListAutocompleteCommands(c.TeamId, c.T)
+	if err != nil {
+		c.Err = err
+		return
+	}
 
-func InitCommand(r *mux.Router) {
-	l4g.Debug("Initializing command api routes")
-	r.Handle("/command", ApiUserRequired(command)).Methods("POST")
+	w.Write([]byte(model.CommandListToJson(commands)))
 }
 
-func command(c *Context, w http.ResponseWriter, r *http.Request) {
+func executeCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	commandArgs := model.CommandArgsFromJson(r.Body)
+	if commandArgs == nil {
+		c.SetInvalidParam("executeCommand", "command_args")
+		return
+	}
 
+	if len(commandArgs.Command) <= 1 || strings.Index(commandArgs.Command, "/") != 0 {
+		c.Err = model.NewAppError("executeCommand", "api.command.execute_command.start.app_error", nil, "", http.StatusBadRequest)
+		return
+	}
+
+	if len(commandArgs.ChannelId) > 0 {
+		if !c.App.SessionHasPermissionToChannel(c.Session, commandArgs.ChannelId, model.PERMISSION_USE_SLASH_COMMANDS) {
+			c.SetPermissionError(model.PERMISSION_USE_SLASH_COMMANDS)
+			return
+		}
+	}
+
+	commandArgs.TeamId = c.TeamId
+	commandArgs.UserId = c.Session.UserId
+	commandArgs.T = c.T
+	commandArgs.Session = c.Session
+	commandArgs.SiteURL = c.GetSiteURLHeader()
+
+	response, err := c.App.ExecuteCommand(commandArgs)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(response.ToJson()))
+}
+
+func createCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	cmd := model.CommandFromJson(r.Body)
+
+	if cmd == nil {
+		c.SetInvalidParam("createCommand", "command")
+		return
+	}
+
+	c.LogAudit("attempt")
+
+	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_SLASH_COMMANDS)
+		return
+	}
+
+	cmd.CreatorId = c.Session.UserId
+	cmd.TeamId = c.TeamId
+
+	rcmd, err := c.App.CreateCommand(cmd)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	c.LogAudit("success")
+	w.Write([]byte(rcmd.ToJson()))
+}
+
+func updateCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	cmd := model.CommandFromJson(r.Body)
+
+	if cmd == nil {
+		c.SetInvalidParam("updateCommand", "command")
+		return
+	}
+
+	c.LogAudit("attempt")
+
+	oldCmd, err := c.App.GetCommand(cmd.Id)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	if c.TeamId != oldCmd.TeamId {
+		c.Err = model.NewAppError("updateCommand", "api.command.team_mismatch.app_error", nil, "user_id="+c.Session.UserId, http.StatusBadRequest)
+		return
+	}
+
+	if !app.SessionHasPermissionToTeam(c.Session, oldCmd.TeamId, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_SLASH_COMMANDS)
+		return
+	}
+
+	if c.Session.UserId != oldCmd.CreatorId && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS)
+		return
+	}
+
+	rcmd, err := c.App.UpdateCommand(oldCmd, cmd)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	c.LogAudit("success")
+
+	w.Write([]byte(rcmd.ToJson()))
+}
+
+func listTeamCommands(c *Context, w http.ResponseWriter, r *http.Request) {
+	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_SLASH_COMMANDS)
+		return
+	}
+
+	cmds, err := c.App.ListTeamCommands(c.TeamId)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(model.CommandListToJson(cmds)))
+}
+
+func regenCommandToken(c *Context, w http.ResponseWriter, r *http.Request) {
 	props := model.MapFromJson(r.Body)
 
-	command := &model.Command{
-		Command:     strings.TrimSpace(props["command"]),
-		ChannelId:   strings.TrimSpace(props["channelId"]),
-		Suggest:     props["suggest"] == "true",
-		Suggestions: make([]*model.SuggestCommand, 0, 128),
-	}
-
-	checkCommand(c, command)
-	if c.Err != nil {
+	id := props["id"]
+	if len(id) == 0 {
+		c.SetInvalidParam("regenCommandToken", "id")
 		return
+	}
+
+	c.LogAudit("attempt")
+
+	cmd, err := c.App.GetCommand(id)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	if c.TeamId != cmd.TeamId {
+		c.Err = model.NewAppError("regenCommandToken", "api.command.team_mismatch.app_error", nil, "user_id="+c.Session.UserId, http.StatusBadRequest)
+		return
+	}
+
+	if !app.SessionHasPermissionToTeam(c.Session, cmd.TeamId, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_SLASH_COMMANDS)
+		return
+	}
+
+	if c.Session.UserId != cmd.CreatorId && !app.SessionHasPermissionToTeam(c.Session, cmd.TeamId, model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS)
+		return
+	}
+
+	rcmd, err := c.App.RegenCommandToken(cmd)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(rcmd.ToJson()))
+}
+
+func deleteCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	props := model.MapFromJson(r.Body)
+
+	id := props["id"]
+	if len(id) == 0 {
+		c.SetInvalidParam("deleteCommand", "id")
+		return
+	}
+
+	c.LogAudit("attempt")
+
+	cmd, err := c.App.GetCommand(id)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	if c.TeamId != cmd.TeamId {
+		c.Err = model.NewAppError("deleteCommand", "api.command.team_mismatch.app_error", nil, "user_id="+c.Session.UserId, http.StatusBadRequest)
+		return
+	}
+
+	if !app.SessionHasPermissionToTeam(c.Session, cmd.TeamId, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_SLASH_COMMANDS)
+		c.LogAudit("fail - inappropriate permissions")
+		return
+	}
+
+	if c.Session.UserId != cmd.CreatorId && !app.SessionHasPermissionToTeam(c.Session, cmd.TeamId, model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS)
+		c.LogAudit("fail - inappropriate permissions")
+		return
+	}
+
+	err = c.App.DeleteCommand(cmd.Id)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	c.LogAudit("success")
+	w.Write([]byte(model.MapToJson(props)))
+}
+
+func testCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+
+	msg := ""
+	if r.Method == "POST" {
+		msg = msg + "\ntoken=" + r.FormValue("token")
+		msg = msg + "\nteam_domain=" + r.FormValue("team_domain")
 	} else {
-		w.Write([]byte(command.ToJson()))
+		body, _ := ioutil.ReadAll(r.Body)
+		msg = string(body)
 	}
+
+	rc := &model.CommandResponse{
+		Text:         "test command response " + msg,
+		ResponseType: model.COMMAND_RESPONSE_TYPE_IN_CHANNEL,
+	}
+
+	w.Write([]byte(rc.ToJson()))
 }
 
-func checkCommand(c *Context, command *model.Command) bool {
+func testEphemeralCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
 
-	if len(command.Command) == 0 || strings.Index(command.Command, "/") != 0 {
-		c.Err = model.NewAppError("checkCommand", "Command must start with /", "")
-		return false
+	msg := ""
+	if r.Method == "POST" {
+		msg = msg + "\ntoken=" + r.FormValue("token")
+		msg = msg + "\nteam_domain=" + r.FormValue("team_domain")
+	} else {
+		body, _ := ioutil.ReadAll(r.Body)
+		msg = string(body)
 	}
 
-	if len(command.ChannelId) > 0 {
-		cchan := Srv.Store.Channel().CheckPermissionsTo(c.Session.TeamId, command.ChannelId, c.Session.UserId)
-
-		if !c.HasPermissionsToChannel(cchan, "checkCommand") {
-			return true
-		}
+	rc := &model.CommandResponse{
+		Text:         "test command response " + msg,
+		ResponseType: model.COMMAND_RESPONSE_TYPE_EPHEMERAL,
 	}
 
-	for _, v := range commands {
-
-		if v(c, command) || c.Err != nil {
-			return true
-		}
-	}
-
-	return false
-}
-
-func logoutCommand(c *Context, command *model.Command) bool {
-
-	cmd := "/logout"
-
-	if strings.Index(command.Command, cmd) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Logout"})
-
-		if !command.Suggest {
-			command.GotoLocation = "/logout"
-			command.Response = model.RESP_EXECUTED
-			return true
-		}
-
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Logout"})
-	}
-
-	return false
-}
-
-func echoCommand(c *Context, command *model.Command) bool {
-	cmd := "/echo"
-	maxThreads := 100
-
-	if !command.Suggest && strings.Index(command.Command, cmd) == 0 {
-		parameters := strings.SplitN(command.Command, " ", 2)
-		if len(parameters) != 2 || len(parameters[1]) == 0 {
-			return false
-		}
-		message := strings.Trim(parameters[1], " ")
-		delay := 0
-		if endMsg := strings.LastIndex(message, "\""); string(message[0]) == "\"" && endMsg > 1 {
-			if checkDelay, err := strconv.Atoi(strings.Trim(message[endMsg:], " \"")); err == nil {
-				delay = checkDelay
-			}
-			message = message[1:endMsg]
-		} else if strings.Index(message, " ") > -1 {
-			delayIdx := strings.LastIndex(message, " ")
-			delayStr := strings.Trim(message[delayIdx:], " ")
-
-			if checkDelay, err := strconv.Atoi(delayStr); err == nil {
-				delay = checkDelay
-				message = message[:delayIdx]
-			}
-		}
-
-		if delay > 10000 {
-			c.Err = model.NewAppError("echoCommand", "Delays must be under 10000 seconds", "")
-			return false
-		}
-
-		if echoSem == nil {
-			// We want one additional thread allowed so we never reach channel lockup
-			echoSem = make(chan bool, maxThreads+1)
-		}
-
-		if len(echoSem) >= maxThreads {
-			c.Err = model.NewAppError("echoCommand", "High volume of echo request, cannot process request", "")
-			return false
-		}
-
-		echoSem <- true
-		go func() {
-			defer func() { <-echoSem }()
-			post := &model.Post{}
-			post.ChannelId = command.ChannelId
-			post.Message = message
-
-			time.Sleep(time.Duration(delay) * time.Second)
-
-			if _, err := CreatePost(c, post, false); err != nil {
-				l4g.Error("Unable to create /echo post, err=%v", err)
-			}
-		}()
-
-		command.Response = model.RESP_EXECUTED
-		return true
-
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Echo back text from your account, /echo \"message\" [delay in seconds]"})
-	}
-
-	return false
-}
-
-func joinCommand(c *Context, command *model.Command) bool {
-
-	// looks for "/join channel-name"
-	cmd := "/join"
-
-	if strings.Index(command.Command, cmd) == 0 {
-
-		parts := strings.Split(command.Command, " ")
-
-		startsWith := ""
-
-		if len(parts) == 2 {
-			startsWith = parts[1]
-		}
-
-		if result := <-Srv.Store.Channel().GetMoreChannels(c.Session.TeamId, c.Session.UserId); result.Err != nil {
-			c.Err = result.Err
-			return false
-		} else {
-			channels := result.Data.(*model.ChannelList)
-
-			for _, v := range channels.Channels {
-
-				if v.Name == startsWith && !command.Suggest {
-
-					if v.Type == model.CHANNEL_DIRECT {
-						return false
-					}
-
-					JoinChannel(c, v.Id, "")
-
-					if c.Err != nil {
-						return false
-					}
-
-					command.GotoLocation = "/channels/" + v.Name
-					command.Response = model.RESP_EXECUTED
-					return true
-				}
-
-				if len(startsWith) == 0 || strings.Index(v.Name, startsWith) == 0 {
-					command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd + " " + v.Name, Description: "Join the open channel"})
-				}
-			}
-		}
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Join an open channel"})
-	}
-
-	return false
-}
-
-func loadTestCommand(c *Context, command *model.Command) bool {
-	cmd := "/loadtest"
-
-	// This command is only available when AllowTesting is true
-	if !utils.Cfg.ServiceSettings.AllowTesting {
-		return false
-	}
-
-	if strings.Index(command.Command, cmd) == 0 {
-		if loadTestSetupCommand(c, command) {
-			return true
-		}
-		if loadTestUsersCommand(c, command) {
-			return true
-		}
-		if loadTestChannelsCommand(c, command) {
-			return true
-		}
-		if loadTestPostsCommand(c, command) {
-			return true
-		}
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Debug Load Testing"})
-	}
-
-	return false
-}
-
-func parseRange(command string, cmd string) (utils.Range, bool) {
-	tokens := strings.Fields(strings.TrimPrefix(command, cmd))
-	var begin int
-	var end int
-	var err1 error
-	var err2 error
-	switch {
-	case len(tokens) == 1:
-		begin, err1 = strconv.Atoi(tokens[0])
-		end = begin
-		if err1 != nil {
-			return utils.Range{0, 0}, false
-		}
-	case len(tokens) >= 2:
-		begin, err1 = strconv.Atoi(tokens[0])
-		end, err2 = strconv.Atoi(tokens[1])
-		if err1 != nil || err2 != nil {
-			return utils.Range{0, 0}, false
-		}
-	default:
-		return utils.Range{0, 0}, false
-	}
-	return utils.Range{begin, end}, true
-}
-
-func contains(items []string, token string) bool {
-	for _, elem := range items {
-		if elem == token {
-			return true
-		}
-	}
-	return false
-}
-
-func loadTestSetupCommand(c *Context, command *model.Command) bool {
-	cmd := "/loadtest setup"
-
-	if strings.Index(command.Command, cmd) == 0 && !command.Suggest {
-		tokens := strings.Fields(strings.TrimPrefix(command.Command, cmd))
-		doTeams := contains(tokens, "teams")
-		doFuzz := contains(tokens, "fuzz")
-
-		numArgs := 0
-		if doTeams {
-			numArgs++
-		}
-		if doFuzz {
-			numArgs++
-		}
-
-		var numTeams int
-		var numChannels int
-		var numUsers int
-		var numPosts int
-
-		// Defaults
-		numTeams = 10
-		numChannels = 10
-		numUsers = 10
-		numPosts = 10
-
-		if doTeams {
-			if (len(tokens) - numArgs) >= 4 {
-				numTeams, _ = strconv.Atoi(tokens[numArgs+0])
-				numChannels, _ = strconv.Atoi(tokens[numArgs+1])
-				numUsers, _ = strconv.Atoi(tokens[numArgs+2])
-				numPosts, _ = strconv.Atoi(tokens[numArgs+3])
-			}
-		} else {
-			if (len(tokens) - numArgs) >= 3 {
-				numChannels, _ = strconv.Atoi(tokens[numArgs+0])
-				numUsers, _ = strconv.Atoi(tokens[numArgs+1])
-				numPosts, _ = strconv.Atoi(tokens[numArgs+2])
-			}
-		}
-		client := model.NewClient(c.GetSiteURL())
-
-		if doTeams {
-			if err := CreateBasicUser(client); err != nil {
-				l4g.Error("Failed to create testing enviroment")
-				return true
-			}
-			client.LoginByEmail(BTEST_TEAM_NAME, BTEST_USER_EMAIL, BTEST_USER_PASSWORD)
-			enviroment, err := CreateTestEnviromentWithTeams(
-				client,
-				utils.Range{numTeams, numTeams},
-				utils.Range{numChannels, numChannels},
-				utils.Range{numUsers, numUsers},
-				utils.Range{numPosts, numPosts},
-				doFuzz)
-			if err != true {
-				l4g.Error("Failed to create testing enviroment")
-				return true
-			} else {
-				l4g.Info("Testing enviroment created")
-				for i := 0; i < len(enviroment.Teams); i++ {
-					l4g.Info("Team Created: " + enviroment.Teams[i].Name)
-					l4g.Info("\t User to login: " + enviroment.Enviroments[i].Users[0].Email + ", " + USER_PASSWORD)
-				}
-			}
-		} else {
-			client.MockSession(c.Session.Id)
-			CreateTestEnviromentInTeam(
-				client,
-				c.Session.TeamId,
-				utils.Range{numChannels, numChannels},
-				utils.Range{numUsers, numUsers},
-				utils.Range{numPosts, numPosts},
-				doFuzz)
-		}
-		return true
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{
-			Suggestion:  cmd,
-			Description: "Creates a testing enviroment in current team. [teams] [fuzz] <Num Channels> <Num Users> <NumPosts>"})
-	}
-
-	return false
-}
-
-func loadTestUsersCommand(c *Context, command *model.Command) bool {
-	cmd1 := "/loadtest users"
-	cmd2 := "/loadtest users fuzz"
-
-	if strings.Index(command.Command, cmd1) == 0 && !command.Suggest {
-		cmd := cmd1
-		doFuzz := false
-		if strings.Index(command.Command, cmd2) == 0 {
-			doFuzz = true
-			cmd = cmd2
-		}
-		usersr, err := parseRange(command.Command, cmd)
-		if err == false {
-			usersr = utils.Range{10, 15}
-		}
-		client := model.NewClient(c.GetSiteURL())
-		userCreator := NewAutoUserCreator(client, c.Session.TeamId)
-		userCreator.Fuzzy = doFuzz
-		userCreator.CreateTestUsers(usersr)
-		return true
-	} else if strings.Index(cmd1, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd1, Description: "Add a specified number of random users to current team <Min Users> <Max Users>"})
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random users with fuzz text to current team <Min Users> <Max Users>"})
-	} else if strings.Index(cmd2, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random users with fuzz text to current team <Min Users> <Max Users>"})
-	}
-
-	return false
-}
-
-func loadTestChannelsCommand(c *Context, command *model.Command) bool {
-	cmd1 := "/loadtest channels"
-	cmd2 := "/loadtest channels fuzz"
-
-	if strings.Index(command.Command, cmd1) == 0 && !command.Suggest {
-		cmd := cmd1
-		doFuzz := false
-		if strings.Index(command.Command, cmd2) == 0 {
-			doFuzz = true
-			cmd = cmd2
-		}
-		channelsr, err := parseRange(command.Command, cmd)
-		if err == false {
-			channelsr = utils.Range{20, 30}
-		}
-		client := model.NewClient(c.GetSiteURL())
-		client.MockSession(c.Session.Id)
-		channelCreator := NewAutoChannelCreator(client, c.Session.TeamId)
-		channelCreator.Fuzzy = doFuzz
-		channelCreator.CreateTestChannels(channelsr)
-		return true
-	} else if strings.Index(cmd1, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd1, Description: "Add a specified number of random channels to current team <MinChannels> <MaxChannels>"})
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random channels with fuzz text to current team <Min Channels> <Max Channels>"})
-	} else if strings.Index(cmd2, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random channels with fuzz text to current team <Min Channels> <Max Channels>"})
-	}
-
-	return false
-}
-
-func loadTestPostsCommand(c *Context, command *model.Command) bool {
-	cmd1 := "/loadtest posts"
-	cmd2 := "/loadtest posts fuzz"
-
-	if strings.Index(command.Command, cmd1) == 0 && !command.Suggest {
-		cmd := cmd1
-		doFuzz := false
-		if strings.Index(command.Command, cmd2) == 0 {
-			cmd = cmd2
-			doFuzz = true
-		}
-
-		postsr, err := parseRange(command.Command, cmd)
-		if err == false {
-			postsr = utils.Range{20, 30}
-		}
-
-		tokens := strings.Fields(strings.TrimPrefix(command.Command, cmd))
-		rimages := utils.Range{0, 0}
-		if len(tokens) >= 3 {
-			if numImages, err := strconv.Atoi(tokens[2]); err == nil {
-				rimages = utils.Range{numImages, numImages}
-			}
-		}
-
-		var usernames []string
-		if result := <-Srv.Store.User().GetProfiles(c.Session.TeamId); result.Err == nil {
-			profileUsers := result.Data.(map[string]*model.User)
-			usernames = make([]string, len(profileUsers))
-			i := 0
-			for _, userprof := range profileUsers {
-				usernames[i] = userprof.Username
-				i++
-			}
-		}
-
-		client := model.NewClient(c.GetSiteURL())
-		client.MockSession(c.Session.Id)
-		testPoster := NewAutoPostCreator(client, command.ChannelId)
-		testPoster.Fuzzy = doFuzz
-		testPoster.Users = usernames
-
-		numImages := utils.RandIntFromRange(rimages)
-		numPosts := utils.RandIntFromRange(postsr)
-		for i := 0; i < numPosts; i++ {
-			testPoster.HasImage = (i < numImages)
-			testPoster.CreateRandomPost()
-		}
-		return true
-	} else if strings.Index(cmd1, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd1, Description: "Add some random posts to current channel <Min Posts> <Max Posts> <Min Images> <Max Images>"})
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add some random posts with fuzz text to current channel <Min Posts> <Max Posts> <Min Images> <Max Images>"})
-	} else if strings.Index(cmd2, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add some random posts with fuzz text to current channel <Min Posts> <Max Posts> <Min Images> <Max Images>"})
-	}
-
-	return false
+	w.Write([]byte(rc.ToJson()))
 }

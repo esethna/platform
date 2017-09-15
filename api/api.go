@@ -1,65 +1,150 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
 
 import (
-	"bytes"
-	l4g "code.google.com/p/log4go"
-	"github.com/mattermost/platform/model"
-	"github.com/mattermost/platform/utils"
-	"html/template"
 	"net/http"
+
+	l4g "github.com/alecthomas/log4go"
+	"github.com/gorilla/mux"
+	"github.com/mattermost/mattermost-server/app"
+	"github.com/mattermost/mattermost-server/einterfaces"
+	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/utils"
+
+	_ "github.com/nicksnyder/go-i18n/i18n"
 )
 
-var ServerTemplates *template.Template
+type Routes struct {
+	Root    *mux.Router // ''
+	ApiRoot *mux.Router // 'api/v3'
 
-type ServerTemplatePage Page
+	Users    *mux.Router // 'api/v3/users'
+	NeedUser *mux.Router // 'api/v3/users/{user_id:[A-Za-z0-9]+}'
 
-func NewServerTemplatePage(templateName string) *ServerTemplatePage {
-	return &ServerTemplatePage{
-		TemplateName: templateName,
-		Props:        make(map[string]string),
-		ClientProps:  utils.ClientProperties,
+	Teams    *mux.Router // 'api/v3/teams'
+	NeedTeam *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}'
+
+	Channels        *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/channels'
+	NeedChannel     *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/channels/{channel_id:[A-Za-z0-9]+}'
+	NeedChannelName *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/channels/name/{channel_name:[A-Za-z0-9_-]+}'
+
+	Posts    *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/channels/{channel_id:[A-Za-z0-9]+}/posts'
+	NeedPost *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/channels/{channel_id:[A-Za-z0-9]+}/posts/{post_id:[A-Za-z0-9]+}'
+
+	Commands *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/commands'
+	Hooks    *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/hooks'
+
+	TeamFiles *mux.Router // 'api/v3/teams/{team_id:[A-Za-z0-9]+}/files'
+	Files     *mux.Router // 'api/v3/files'
+	NeedFile  *mux.Router // 'api/v3/files/{file_id:[A-Za-z0-9]+}'
+
+	OAuth *mux.Router // 'api/v3/oauth'
+
+	Admin *mux.Router // 'api/v3/admin'
+
+	General *mux.Router // 'api/v3/general'
+
+	Preferences *mux.Router // 'api/v3/preferences'
+
+	License *mux.Router // 'api/v3/license'
+
+	Public *mux.Router // 'api/v3/public'
+
+	Emoji *mux.Router // 'api/v3/emoji'
+
+	Webrtc *mux.Router // 'api/v3/webrtc'
+}
+
+var BaseRoutes *Routes
+
+func NewRouter() *mux.Router {
+	ret := mux.NewRouter()
+	ret.NotFoundHandler = http.HandlerFunc(Handle404)
+	return ret
+}
+
+func InitApi(root *mux.Router) {
+	BaseRoutes = &Routes{}
+	BaseRoutes.Root = root
+	BaseRoutes.ApiRoot = root.PathPrefix(model.API_URL_SUFFIX_V3).Subrouter()
+	BaseRoutes.Users = BaseRoutes.ApiRoot.PathPrefix("/users").Subrouter()
+	BaseRoutes.NeedUser = BaseRoutes.Users.PathPrefix("/{user_id:[A-Za-z0-9]+}").Subrouter()
+	BaseRoutes.Teams = BaseRoutes.ApiRoot.PathPrefix("/teams").Subrouter()
+	BaseRoutes.NeedTeam = BaseRoutes.Teams.PathPrefix("/{team_id:[A-Za-z0-9]+}").Subrouter()
+	BaseRoutes.Channels = BaseRoutes.NeedTeam.PathPrefix("/channels").Subrouter()
+	BaseRoutes.NeedChannel = BaseRoutes.Channels.PathPrefix("/{channel_id:[A-Za-z0-9]+}").Subrouter()
+	BaseRoutes.NeedChannelName = BaseRoutes.Channels.PathPrefix("/name/{channel_name:[A-Za-z0-9_-]+}").Subrouter()
+	BaseRoutes.Posts = BaseRoutes.NeedChannel.PathPrefix("/posts").Subrouter()
+	BaseRoutes.NeedPost = BaseRoutes.Posts.PathPrefix("/{post_id:[A-Za-z0-9]+}").Subrouter()
+	BaseRoutes.Commands = BaseRoutes.NeedTeam.PathPrefix("/commands").Subrouter()
+	BaseRoutes.TeamFiles = BaseRoutes.NeedTeam.PathPrefix("/files").Subrouter()
+	BaseRoutes.Files = BaseRoutes.ApiRoot.PathPrefix("/files").Subrouter()
+	BaseRoutes.NeedFile = BaseRoutes.Files.PathPrefix("/{file_id:[A-Za-z0-9]+}").Subrouter()
+	BaseRoutes.Hooks = BaseRoutes.NeedTeam.PathPrefix("/hooks").Subrouter()
+	BaseRoutes.OAuth = BaseRoutes.ApiRoot.PathPrefix("/oauth").Subrouter()
+	BaseRoutes.Admin = BaseRoutes.ApiRoot.PathPrefix("/admin").Subrouter()
+	BaseRoutes.General = BaseRoutes.ApiRoot.PathPrefix("/general").Subrouter()
+	BaseRoutes.Preferences = BaseRoutes.ApiRoot.PathPrefix("/preferences").Subrouter()
+	BaseRoutes.License = BaseRoutes.ApiRoot.PathPrefix("/license").Subrouter()
+	BaseRoutes.Public = BaseRoutes.ApiRoot.PathPrefix("/public").Subrouter()
+	BaseRoutes.Emoji = BaseRoutes.ApiRoot.PathPrefix("/emoji").Subrouter()
+	BaseRoutes.Webrtc = BaseRoutes.ApiRoot.PathPrefix("/webrtc").Subrouter()
+
+	InitUser()
+	InitTeam()
+	InitChannel()
+	InitPost()
+	InitWebSocket()
+	InitFile()
+	InitCommand()
+	InitAdmin()
+	InitGeneral()
+	InitOAuth()
+	InitWebhook()
+	InitPreference()
+	InitLicense()
+	InitEmoji()
+	InitStatus()
+	InitWebrtc()
+	InitReaction()
+	InitDeprecated()
+
+	// 404 on any api route before web.go has a chance to serve it
+	root.Handle("/api/{anything:.*}", http.HandlerFunc(Handle404))
+
+	utils.InitHTML()
+
+	app.InitEmailBatching()
+
+	if *utils.Cfg.ServiceSettings.EnableAPIv3 {
+		l4g.Info("API version 3 is scheduled for deprecation. Please see https://api.mattermost.com for details.")
 	}
 }
 
-func (me *ServerTemplatePage) Render() string {
-	var text bytes.Buffer
-	if err := ServerTemplates.ExecuteTemplate(&text, me.TemplateName, me); err != nil {
-		l4g.Error("Error rendering template %v err=%v", me.TemplateName, err)
-	}
-
-	return text.String()
-}
-
-func InitApi() {
-	r := Srv.Router.PathPrefix("/api/v1").Subrouter()
-	InitUser(r)
-	InitTeam(r)
-	InitChannel(r)
-	InitPost(r)
-	InitWebSocket(r)
-	InitFile(r)
-	InitCommand(r)
-	InitAdmin(r)
-	InitOAuth(r)
-
-	templatesDir := utils.FindDir("api/templates")
-	l4g.Debug("Parsing server templates at %v", templatesDir)
-	var err error
-	if ServerTemplates, err = template.ParseGlob(templatesDir + "*.html"); err != nil {
-		l4g.Error("Failed to parse server templates %v", err)
-	}
-}
-
-func HandleEtag(etag string, w http.ResponseWriter, r *http.Request) bool {
+func HandleEtag(etag string, routeName string, w http.ResponseWriter, r *http.Request) bool {
+	metrics := einterfaces.GetMetricsInterface()
 	if et := r.Header.Get(model.HEADER_ETAG_CLIENT); len(etag) > 0 {
 		if et == etag {
+			w.Header().Set(model.HEADER_ETAG_SERVER, etag)
 			w.WriteHeader(http.StatusNotModified)
+			if metrics != nil {
+				metrics.IncrementEtagHitCounter(routeName)
+			}
 			return true
 		}
 	}
 
+	if metrics != nil {
+		metrics.IncrementEtagMissCounter(routeName)
+	}
+
 	return false
+}
+
+func ReturnStatusOK(w http.ResponseWriter) {
+	m := make(map[string]string)
+	m[model.STATUS] = model.STATUS_OK
+	w.Write([]byte(model.MapToJson(m)))
 }

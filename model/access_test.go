@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -10,7 +10,8 @@ import (
 
 func TestAccessJson(t *testing.T) {
 	a1 := AccessData{}
-	a1.AuthCode = NewId()
+	a1.ClientId = NewId()
+	a1.UserId = NewId()
 	a1.Token = NewId()
 	a1.RefreshToken = NewId()
 
@@ -26,15 +27,70 @@ func TestAccessIsValid(t *testing.T) {
 	ad := AccessData{}
 
 	if err := ad.IsValid(); err == nil {
-		t.Fatal("should have failed")
+		t.Fatal()
 	}
 
-	ad.AuthCode = NewId()
+	ad.ClientId = NewRandomString(28)
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed Client Id")
+	}
+
+	ad.ClientId = ""
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed Client Id")
+	}
+
+	ad.ClientId = NewId()
+	if err := ad.IsValid(); err == nil {
+		t.Fatal()
+	}
+
+	ad.UserId = NewRandomString(28)
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed User Id")
+	}
+
+	ad.UserId = ""
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed User Id")
+	}
+
+	ad.UserId = NewId()
 	if err := ad.IsValid(); err == nil {
 		t.Fatal("should have failed")
 	}
 
+	ad.Token = NewRandomString(22)
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed Token")
+	}
+
 	ad.Token = NewId()
+	if err := ad.IsValid(); err == nil {
+		t.Fatal()
+	}
+
+	ad.RefreshToken = NewRandomString(28)
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed Refresh Token")
+	}
+
+	ad.RefreshToken = NewId()
+	if err := ad.IsValid(); err == nil {
+		t.Fatal()
+	}
+
+	ad.RedirectUri = ""
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed Redirect URI not set")
+	}
+
+	ad.RedirectUri = NewRandomString(28)
+	if err := ad.IsValid(); err == nil {
+		t.Fatal("Should have failed invalid URL")
+	}
+
+	ad.RedirectUri = "http://example.com"
 	if err := ad.IsValid(); err != nil {
 		t.Fatal(err)
 	}

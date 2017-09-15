@@ -1,66 +1,91 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
-	l4g "code.google.com/p/log4go"
-	"github.com/mattermost/platform/model"
-	"github.com/mattermost/platform/store"
-	"github.com/mattermost/platform/utils"
+	l4g "github.com/alecthomas/log4go"
+	"github.com/gorilla/mux"
+	goi18n "github.com/nicksnyder/go-i18n/i18n"
+
+	"github.com/mattermost/mattermost-server/app"
+	"github.com/mattermost/mattermost-server/einterfaces"
+	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/utils"
 )
 
-var sessionCache *utils.Cache = utils.NewLru(model.SESSION_CACHE_SIZE)
-
 type Context struct {
-	Session      model.Session
-	RequestId    string
-	IpAddress    string
-	Path         string
-	Err          *model.AppError
-	teamURLValid bool
-	teamURL      string
-	siteURL      string
-}
-
-type Page struct {
-	TemplateName string
-	Props        map[string]string
-	ClientProps  map[string]string
+	App           *app.App
+	Session       model.Session
+	RequestId     string
+	IpAddress     string
+	Path          string
+	Err           *model.AppError
+	siteURLHeader string
+	teamURLValid  bool
+	teamURL       string
+	T             goi18n.TranslateFunc
+	Locale        string
+	TeamId        string
+	isSystemAdmin bool
 }
 
 func ApiAppHandler(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return &handler{h, false, false, true, false, false}
+	return &handler{h, false, false, true, false, false, false, false}
 }
 
 func AppHandler(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return &handler{h, false, false, false, false, false}
+	return &handler{h, false, false, false, false, false, false, false}
 }
 
 func AppHandlerIndependent(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return &handler{h, false, false, false, false, true}
+	return &handler{h, false, false, false, false, true, false, false}
 }
 
 func ApiUserRequired(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return &handler{h, true, false, true, true, false}
+	return &handler{h, true, false, true, false, false, false, true}
 }
 
 func ApiUserRequiredActivity(h func(*Context, http.ResponseWriter, *http.Request), isUserActivity bool) http.Handler {
-	return &handler{h, true, false, true, isUserActivity, false}
+	return &handler{h, true, false, true, isUserActivity, false, false, true}
+}
+
+func ApiUserRequiredMfa(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
+	return &handler{h, true, false, true, false, false, false, false}
 }
 
 func UserRequired(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return &handler{h, true, false, false, false, false}
+	return &handler{h, true, false, false, false, false, false, true}
+}
+
+func AppHandlerTrustRequester(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
+	return &handler{h, false, false, false, false, false, true, false}
 }
 
 func ApiAdminSystemRequired(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return &handler{h, true, true, true, false, false}
+	return &handler{h, true, true, true, false, false, false, true}
+}
+
+func ApiAdminSystemRequiredTrustRequester(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
+	return &handler{h, true, true, true, false, false, true, true}
+}
+
+func ApiAppHandlerTrustRequester(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
+	return &handler{h, false, false, true, false, false, true, false}
+}
+
+func ApiUserRequiredTrustRequester(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
+	return &handler{h, true, false, true, false, false, true, true}
+}
+
+func ApiAppHandlerTrustRequesterIndependent(h func(*Context, http.ResponseWriter, *http.Request)) http.Handler {
+	return &handler{h, false, false, true, false, true, true, false}
 }
 
 type handler struct {
@@ -70,15 +95,24 @@ type handler struct {
 	isApi              bool
 	isUserActivity     bool
 	isTeamIndependent  bool
+	trustRequester     bool
+	requireMfa         bool
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
+	now := time.Now()
 	l4g.Debug("%v", r.URL.Path)
 
+	if metrics := einterfaces.GetMetricsInterface(); metrics != nil && h.isApi {
+		metrics.IncrementHttpRequest()
+	}
+
 	c := &Context{}
+	c.App = app.Global()
+	c.T, c.Locale = utils.GetTranslationsAndLocale(w, r)
 	c.RequestId = model.NewId()
-	c.IpAddress = GetIpAddress(r)
+	c.IpAddress = utils.GetIpAddress(r)
+	c.TeamId = mux.Vars(r)["team_id"]
 
 	token := ""
 	isTokenFromQueryString := false
@@ -96,8 +130,15 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Attempt to parse the token from the cookie
 	if len(token) == 0 {
-		if cookie, err := r.Cookie(model.SESSION_TOKEN); err == nil {
+		if cookie, err := r.Cookie(model.SESSION_COOKIE_TOKEN); err == nil {
 			token = cookie.Value
+
+			if (h.requireSystemAdmin || h.requireUser) && !h.trustRequester {
+				if r.Header.Get(model.HEADER_REQUESTED_WITH) != model.HEADER_REQUESTED_WITH_XML {
+					c.Err = model.NewAppError("ServeHTTP", "api.context.session_expired.app_error", nil, "token="+token+" Appears to be a CSRF attempt", http.StatusUnauthorized)
+					token = ""
+				}
+			}
 		}
 	}
 
@@ -107,72 +148,59 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		isTokenFromQueryString = true
 	}
 
-	protocol := "http"
-
-	// If the request came from the ELB then assume this is produciton
-	// and redirect all http requests to https
-	if utils.Cfg.ServiceSettings.UseSSL {
-		forwardProto := r.Header.Get(model.HEADER_FORWARDED_PROTO)
-		if forwardProto == "http" {
-			l4g.Info("redirecting http request to https for %v", r.URL.Path)
-			http.Redirect(w, r, "https://"+r.Host, http.StatusTemporaryRedirect)
-			return
-		} else {
-			protocol = "https"
-		}
-	}
-
-	c.setSiteURL(protocol + "://" + r.Host)
+	c.SetSiteURLHeader(app.GetProtocol(r) + "://" + r.Host)
 
 	w.Header().Set(model.HEADER_REQUEST_ID, c.RequestId)
-	w.Header().Set(model.HEADER_VERSION_ID, utils.Cfg.ServiceSettings.Version+fmt.Sprintf(".%v", utils.CfgLastModified))
+	w.Header().Set(model.HEADER_VERSION_ID, fmt.Sprintf("%v.%v.%v.%v", model.CurrentVersion, model.BuildNumber, utils.ClientCfgHash, utils.IsLicensed()))
 
-	// Instruct the browser not to display us in an iframe for anti-clickjacking
+	// Instruct the browser not to display us in an iframe unless is the same origin for anti-clickjacking
 	if !h.isApi {
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "frame-ancestors none")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Content-Security-Policy", "frame-ancestors 'self'")
 	} else {
 		// All api response bodies will be JSON formatted by default
 		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method == "GET" {
+			w.Header().Set("Expires", "0")
+		}
 	}
 
 	if len(token) != 0 {
-		var session *model.Session
-		if ts, ok := sessionCache.Get(token); ok {
-			session = ts.(*model.Session)
-		}
+		session, err := app.Global().GetSession(token)
 
-		if session == nil {
-			if sessionResult := <-Srv.Store.Session().Get(token); sessionResult.Err != nil {
-				c.LogError(model.NewAppError("ServeHTTP", "Invalid session", "token="+token+", err="+sessionResult.Err.DetailedError))
-			} else {
-				session = sessionResult.Data.(*model.Session)
+		if err != nil {
+			l4g.Error(utils.T("api.context.invalid_session.error"), err.Error())
+			c.RemoveSessionCookie(w, r)
+			if h.requireUser || h.requireSystemAdmin {
+				c.Err = model.NewAppError("ServeHTTP", "api.context.session_expired.app_error", nil, "token="+token, http.StatusUnauthorized)
 			}
-		}
-
-		if session == nil || session.IsExpired() {
-			c.RemoveSessionCookie(w)
-			c.Err = model.NewAppError("ServeHTTP", "Invalid or expired session, please login again.", "token="+token)
-			c.Err.StatusCode = http.StatusUnauthorized
 		} else if !session.IsOAuth && isTokenFromQueryString {
-			c.Err = model.NewAppError("ServeHTTP", "Session is not OAuth but token was provided in the query string", "token="+token)
-			c.Err.StatusCode = http.StatusUnauthorized
+			c.Err = model.NewAppError("ServeHTTP", "api.context.token_provided.app_error", nil, "token="+token, http.StatusUnauthorized)
 		} else {
 			c.Session = *session
 		}
 	}
 
 	if h.isApi || h.isTeamIndependent {
-		c.setTeamURL(c.GetSiteURL(), false)
+		c.setTeamURL(c.GetSiteURLHeader(), false)
 		c.Path = r.URL.Path
 	} else {
 		splitURL := strings.Split(r.URL.Path, "/")
-		c.setTeamURL(protocol+"://"+r.Host+"/"+splitURL[1], true)
+		c.setTeamURL(c.GetSiteURLHeader()+"/"+splitURL[1], true)
 		c.Path = "/" + strings.Join(splitURL[2:], "/")
+	}
+
+	if h.isApi && !*utils.Cfg.ServiceSettings.EnableAPIv3 {
+		c.Err = model.NewAppError("ServeHTTP", "api.context.v3_disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	if c.Err == nil && h.requireUser {
 		c.UserRequired()
+	}
+
+	if c.Err == nil && h.requireMfa {
+		c.MfaRequired()
 	}
 
 	if c.Err == nil && h.requireSystemAdmin {
@@ -180,38 +208,59 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if c.Err == nil && h.isUserActivity && token != "" && len(c.Session.UserId) > 0 {
-		go func() {
-			if err := (<-Srv.Store.User().UpdateUserAndSessionActivity(c.Session.UserId, c.Session.Id, model.GetMillis())).Err; err != nil {
-				l4g.Error("Failed to update LastActivityAt for user_id=%v and session_id=%v, err=%v", c.Session.UserId, c.Session.Id, err)
-			}
-		}()
+		app.Global().SetStatusOnline(c.Session.UserId, c.Session.Id, false)
+		app.Global().UpdateLastActivityAtIfNeeded(c.Session)
+	}
+
+	if c.Err == nil && (h.requireUser || h.requireSystemAdmin) {
+		//check if teamId exist
+		c.CheckTeamId()
 	}
 
 	if c.Err == nil {
 		h.handleFunc(c, w, r)
 	}
 
+	// Handle errors that have occoured
 	if c.Err != nil {
+		c.Err.Translate(c.T)
 		c.Err.RequestId = c.RequestId
 		c.LogError(c.Err)
 		c.Err.Where = r.URL.Path
 
+		// Block out detailed error when not in developer mode
+		if !*utils.Cfg.ServiceSettings.EnableDeveloper {
+			c.Err.DetailedError = ""
+		}
+
 		if h.isApi {
 			w.WriteHeader(c.Err.StatusCode)
 			w.Write([]byte(c.Err.ToJson()))
+
+			if einterfaces.GetMetricsInterface() != nil {
+				einterfaces.GetMetricsInterface().IncrementHttpError()
+			}
 		} else {
 			if c.Err.StatusCode == http.StatusUnauthorized {
 				http.Redirect(w, r, c.GetTeamURL()+"/?redirect="+url.QueryEscape(r.URL.Path), http.StatusTemporaryRedirect)
 			} else {
-				RenderWebError(c.Err, w, r)
+				utils.RenderWebError(c.Err, w, r)
 			}
+		}
+
+	}
+
+	if h.isApi && einterfaces.GetMetricsInterface() != nil {
+		if r.URL.Path != model.API_URL_SUFFIX_V3+"/users/websocket" {
+			elapsed := float64(time.Since(now)) / float64(time.Second)
+			einterfaces.GetMetricsInterface().ObserveHttpRequestDuration(elapsed)
 		}
 	}
 }
 
 func (c *Context) LogAudit(extraInfo string) {
 	audit := &model.Audit{UserId: c.Session.UserId, IpAddress: c.IpAddress, Action: c.Path, ExtraInfo: extraInfo, SessionId: c.Session.Id}
-	if r := <-Srv.Store.Audit().Save(audit); r.Err != nil {
+	if r := <-app.Global().Srv.Store.Audit().Save(audit); r.Err != nil {
 		c.LogError(r.Err)
 	}
 }
@@ -223,131 +272,119 @@ func (c *Context) LogAuditWithUserId(userId, extraInfo string) {
 	}
 
 	audit := &model.Audit{UserId: userId, IpAddress: c.IpAddress, Action: c.Path, ExtraInfo: extraInfo, SessionId: c.Session.Id}
-	if r := <-Srv.Store.Audit().Save(audit); r.Err != nil {
+	if r := <-app.Global().Srv.Store.Audit().Save(audit); r.Err != nil {
 		c.LogError(r.Err)
 	}
 }
 
 func (c *Context) LogError(err *model.AppError) {
-	l4g.Error("%v:%v code=%v rid=%v uid=%v ip=%v %v [details: %v]", c.Path, err.Where, err.StatusCode,
-		c.RequestId, c.Session.UserId, c.IpAddress, err.Message, err.DetailedError)
+
+	// filter out endless reconnects
+	if c.Path == "/api/v3/users/websocket" && err.StatusCode == 401 || err.Id == "web.check_browser_compatibility.app_error" {
+		c.LogDebug(err)
+	} else if err.Id != "api.post.create_post.town_square_read_only" {
+		l4g.Error(utils.TDefault("api.context.log.error"), c.Path, err.Where, err.StatusCode,
+			c.RequestId, c.Session.UserId, c.IpAddress, err.SystemMessage(utils.TDefault), err.DetailedError)
+	}
+}
+
+func (c *Context) LogDebug(err *model.AppError) {
+	l4g.Debug(utils.TDefault("api.context.log.error"), c.Path, err.Where, err.StatusCode,
+		c.RequestId, c.Session.UserId, c.IpAddress, err.SystemMessage(utils.TDefault), err.DetailedError)
 }
 
 func (c *Context) UserRequired() {
-	if len(c.Session.UserId) == 0 {
-		c.Err = model.NewAppError("", "Invalid or expired session, please login again.", "UserRequired")
-		c.Err.StatusCode = http.StatusUnauthorized
+	if !*utils.Cfg.ServiceSettings.EnableUserAccessTokens && c.Session.Props[model.SESSION_PROP_TYPE] == model.SESSION_TYPE_USER_ACCESS_TOKEN {
+		c.Err = model.NewAppError("", "api.context.session_expired.app_error", nil, "UserAccessToken", http.StatusUnauthorized)
 		return
+	}
+
+	if len(c.Session.UserId) == 0 {
+		c.Err = model.NewAppError("", "api.context.session_expired.app_error", nil, "UserRequired", http.StatusUnauthorized)
+		return
+	}
+}
+
+func (c *Context) MfaRequired() {
+	// Must be licensed for MFA and have it configured for enforcement
+	if !utils.IsLicensed() || !*utils.License().Features.MFA || !*utils.Cfg.ServiceSettings.EnableMultifactorAuthentication || !*utils.Cfg.ServiceSettings.EnforceMultifactorAuthentication {
+		return
+	}
+
+	// OAuth integrations are excepted
+	if c.Session.IsOAuth {
+		return
+	}
+
+	if result := <-app.Global().Srv.Store.User().Get(c.Session.UserId); result.Err != nil {
+		c.Err = model.NewAppError("", "api.context.session_expired.app_error", nil, "MfaRequired", http.StatusUnauthorized)
+		return
+	} else {
+		user := result.Data.(*model.User)
+
+		// Only required for email and ldap accounts
+		if user.AuthService != "" &&
+			user.AuthService != model.USER_AUTH_SERVICE_EMAIL &&
+			user.AuthService != model.USER_AUTH_SERVICE_LDAP {
+			return
+		}
+
+		if !user.MfaActive {
+			c.Err = model.NewAppError("", "api.context.mfa_required.app_error", nil, "MfaRequired", http.StatusUnauthorized)
+			return
+		}
 	}
 }
 
 func (c *Context) SystemAdminRequired() {
 	if len(c.Session.UserId) == 0 {
-		c.Err = model.NewAppError("", "Invalid or expired session, please login again.", "SystemAdminRequired")
-		c.Err.StatusCode = http.StatusUnauthorized
+		c.Err = model.NewAppError("", "api.context.session_expired.app_error", nil, "SystemAdminRequired", http.StatusUnauthorized)
 		return
 	} else if !c.IsSystemAdmin() {
-		c.Err = model.NewAppError("", "You do not have the appropriate permissions", "AdminRequired")
-		c.Err.StatusCode = http.StatusForbidden
+		c.Err = model.NewAppError("", "api.context.permissions.app_error", nil, "AdminRequired", http.StatusForbidden)
 		return
 	}
-}
-
-func (c *Context) HasPermissionsToUser(userId string, where string) bool {
-
-	// You are the user
-	if c.Session.UserId == userId {
-		return true
-	}
-
-	// You're a mattermost system admin and you're on the VPN
-	if c.IsSystemAdmin() {
-		return true
-	}
-
-	c.Err = model.NewAppError(where, "You do not have the appropriate permissions", "userId="+userId)
-	c.Err.StatusCode = http.StatusForbidden
-	return false
-}
-
-func (c *Context) HasPermissionsToTeam(teamId string, where string) bool {
-	if c.Session.TeamId == teamId {
-		return true
-	}
-
-	// You're a mattermost system admin and you're on the VPN
-	if c.IsSystemAdmin() {
-		return true
-	}
-
-	c.Err = model.NewAppError(where, "You do not have the appropriate permissions", "userId="+c.Session.UserId+", teamId="+teamId)
-	c.Err.StatusCode = http.StatusForbidden
-	return false
-}
-
-func (c *Context) HasPermissionsToChannel(sc store.StoreChannel, where string) bool {
-	if cresult := <-sc; cresult.Err != nil {
-		c.Err = cresult.Err
-		return false
-	} else if cresult.Data.(int64) != 1 {
-		c.Err = model.NewAppError(where, "You do not have the appropriate permissions", "userId="+c.Session.UserId)
-		c.Err.StatusCode = http.StatusForbidden
-		return false
-	}
-
-	return true
 }
 
 func (c *Context) IsSystemAdmin() bool {
-	// TODO XXX FIXME && IsPrivateIpAddress(c.IpAddress)
-	if model.IsInRole(c.Session.Roles, model.ROLE_SYSTEM_ADMIN) {
-		return true
-	}
-	return false
+	return app.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM)
 }
 
-func (c *Context) HasSystemAdminPermissions(where string) bool {
-	if c.IsSystemAdmin() {
-		return true
-	}
-
-	c.Err = model.NewAppError(where, "You do not have the appropriate permissions", "userId="+c.Session.UserId)
-	c.Err.StatusCode = http.StatusForbidden
-	return false
-}
-
-func (c *Context) IsTeamAdmin(userId string) bool {
-	if uresult := <-Srv.Store.User().Get(userId); uresult.Err != nil {
-		c.Err = uresult.Err
-		return false
-	} else {
-		user := uresult.Data.(*model.User)
-		return model.IsInRole(c.Session.Roles, model.ROLE_TEAM_ADMIN) && user.TeamId == c.Session.TeamId
-	}
-}
-
-func (c *Context) RemoveSessionCookie(w http.ResponseWriter) {
-
-	sessionCache.Remove(c.Session.Token)
-
+func (c *Context) RemoveSessionCookie(w http.ResponseWriter, r *http.Request) {
 	cookie := &http.Cookie{
-		Name:     model.SESSION_TOKEN,
+		Name:     model.SESSION_COOKIE_TOKEN,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
 	}
 
+	userCookie := &http.Cookie{
+		Name:   model.SESSION_COOKIE_USER,
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	}
+
 	http.SetCookie(w, cookie)
+	http.SetCookie(w, userCookie)
 }
 
 func (c *Context) SetInvalidParam(where string, name string) {
-	c.Err = model.NewAppError(where, "Invalid "+name+" parameter", "")
-	c.Err.StatusCode = http.StatusBadRequest
+	c.Err = NewInvalidParamError(where, name)
+}
+
+func NewInvalidParamError(where string, name string) *model.AppError {
+	err := model.NewAppError(where, "api.context.invalid_param.app_error", map[string]interface{}{"Name": name}, "", http.StatusBadRequest)
+	return err
 }
 
 func (c *Context) SetUnknownError(where string, details string) {
-	c.Err = model.NewAppError(where, "An unknown error has occured. Please contact support.", details)
+	c.Err = model.NewAppError(where, "api.context.unknown.app_error", nil, details, http.StatusInternalServerError)
+}
+
+func (c *Context) SetPermissionError(permission *model.Permission) {
+	c.Err = model.NewAppError("Permissions", "api.context.permissions.app_error", nil, "userId="+c.Session.UserId+", "+"permission="+permission.Id, http.StatusForbidden)
 }
 
 func (c *Context) setTeamURL(url string, valid bool) {
@@ -355,136 +392,69 @@ func (c *Context) setTeamURL(url string, valid bool) {
 	c.teamURLValid = valid
 }
 
-func (c *Context) setTeamURLFromSession() {
-	if result := <-Srv.Store.Team().Get(c.Session.TeamId); result.Err == nil {
-		c.setTeamURL(c.GetSiteURL()+"/"+result.Data.(*model.Team).Name, true)
+func (c *Context) SetTeamURLFromSession() {
+	if result := <-app.Global().Srv.Store.Team().Get(c.TeamId); result.Err == nil {
+		c.setTeamURL(c.GetSiteURLHeader()+"/"+result.Data.(*model.Team).Name, true)
 	}
 }
 
-func (c *Context) setSiteURL(url string) {
-	c.siteURL = url
+func (c *Context) SetSiteURLHeader(url string) {
+	c.siteURLHeader = strings.TrimRight(url, "/")
 }
 
+// TODO see where these are used
 func (c *Context) GetTeamURLFromTeam(team *model.Team) string {
-	return c.GetSiteURL() + "/" + team.Name
+	return c.GetSiteURLHeader() + "/" + team.Name
 }
 
 func (c *Context) GetTeamURL() string {
 	if !c.teamURLValid {
-		c.setTeamURLFromSession()
+		c.SetTeamURLFromSession()
 		if !c.teamURLValid {
-			l4g.Debug("TeamURL accessed when not valid. Team URL should not be used in api functions or those that are team independent")
+			l4g.Debug(utils.T("api.context.invalid_team_url.debug"))
 		}
 	}
 	return c.teamURL
 }
 
-func (c *Context) GetSiteURL() string {
-	return c.siteURL
+func (c *Context) GetSiteURLHeader() string {
+	return c.siteURLHeader
 }
 
-func GetIpAddress(r *http.Request) string {
-	address := r.Header.Get(model.HEADER_FORWARDED)
-	if len(address) == 0 {
-		address, _, _ = net.SplitHostPort(r.RemoteAddr)
-	}
-
-	return address
+func (c *Context) GetCurrentTeamMember() *model.TeamMember {
+	return c.Session.GetTeamByTeamId(c.TeamId)
 }
 
-func IsTestDomain(r *http.Request) bool {
-
-	if strings.Index(r.Host, "localhost") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "dockerhost") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "test") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "127.0.") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "192.168.") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "10.") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "176.") == 0 {
-		return true
-	}
-
-	return false
-}
-
-func IsBetaDomain(r *http.Request) bool {
-
-	if strings.Index(r.Host, "beta") == 0 {
-		return true
-	}
-
-	if strings.Index(r.Host, "ci") == 0 {
-		return true
-	}
-
-	return false
-}
-
-var privateIpAddress = []*net.IPNet{
-	{IP: net.IPv4(10, 0, 0, 1), Mask: net.IPv4Mask(255, 0, 0, 0)},
-	{IP: net.IPv4(176, 16, 0, 1), Mask: net.IPv4Mask(255, 255, 0, 0)},
-	{IP: net.IPv4(192, 168, 0, 1), Mask: net.IPv4Mask(255, 255, 255, 0)},
-	{IP: net.IPv4(127, 0, 0, 1), Mask: net.IPv4Mask(255, 255, 255, 252)},
-}
-
-func IsPrivateIpAddress(ipAddress string) bool {
-
-	for _, pips := range privateIpAddress {
-		if pips.Contains(net.ParseIP(ipAddress)) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func RenderWebError(err *model.AppError, w http.ResponseWriter, r *http.Request) {
-
-	protocol := "http"
-	if utils.Cfg.ServiceSettings.UseSSL {
-		forwardProto := r.Header.Get(model.HEADER_FORWARDED_PROTO)
-		if forwardProto != "http" {
-			protocol = "https"
-		}
-	}
-
-	SiteURL := protocol + "://" + r.Host
-
-	m := make(map[string]string)
-	m["Message"] = err.Message
-	m["Details"] = err.DetailedError
-	m["SiteName"] = utils.Cfg.ServiceSettings.SiteName
-	m["SiteURL"] = SiteURL
-
-	w.WriteHeader(err.StatusCode)
-	ServerTemplates.ExecuteTemplate(w, "error.html", m)
+func IsApiCall(r *http.Request) bool {
+	return strings.Index(r.URL.Path, "/api/") == 0
 }
 
 func Handle404(w http.ResponseWriter, r *http.Request) {
-	err := model.NewAppError("Handle404", "Sorry, we could not find the page.", "")
-	err.StatusCode = http.StatusNotFound
-	l4g.Error("%v: code=404 ip=%v", r.URL.Path, GetIpAddress(r))
-	RenderWebError(err, w, r)
+	err := model.NewAppError("Handle404", "api.context.404.app_error", nil, "", http.StatusNotFound)
+	err.Translate(utils.T)
+
+	l4g.Debug("%v: code=404 ip=%v", r.URL.Path, utils.GetIpAddress(r))
+
+	if IsApiCall(r) {
+		w.WriteHeader(err.StatusCode)
+		err.DetailedError = "There doesn't appear to be an api call for the url='" + r.URL.Path + "'.  Typo? are you missing a team_id or user_id as part of the url?"
+		w.Write([]byte(err.ToJson()))
+	} else {
+		utils.RenderWebError(err, w, r)
+	}
 }
 
-func AddSessionToCache(session *model.Session) {
-	sessionCache.Add(session.Token, session)
+func (c *Context) CheckTeamId() {
+	if c.TeamId != "" && c.Session.GetTeamByTeamId(c.TeamId) == nil {
+		if app.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM) {
+			if result := <-app.Global().Srv.Store.Team().Get(c.TeamId); result.Err != nil {
+				c.Err = result.Err
+				c.Err.StatusCode = http.StatusBadRequest
+				return
+			}
+		} else {
+			c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+			return
+		}
+	}
 }

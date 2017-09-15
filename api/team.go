@@ -1,345 +1,223 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
 
 import (
 	"bytes"
-	l4g "code.google.com/p/log4go"
-	"fmt"
-	"github.com/gorilla/mux"
-	"github.com/mattermost/platform/model"
-	"github.com/mattermost/platform/utils"
+	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
-	"time"
+
+	l4g "github.com/alecthomas/log4go"
+	"github.com/gorilla/mux"
+
+	"github.com/mattermost/mattermost-server/app"
+	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/utils"
 )
 
-func InitTeam(r *mux.Router) {
-	l4g.Debug("Initializing team api routes")
+func InitTeam() {
+	l4g.Debug(utils.T("api.team.init.debug"))
 
-	sr := r.PathPrefix("/teams").Subrouter()
-	sr.Handle("/create", ApiAppHandler(createTeam)).Methods("POST")
-	sr.Handle("/create_from_signup", ApiAppHandler(createTeamFromSignup)).Methods("POST")
-	sr.Handle("/create_with_sso/{service:[A-Za-z]+}", ApiAppHandler(createTeamFromSSO)).Methods("POST")
-	sr.Handle("/signup", ApiAppHandler(signupTeam)).Methods("POST")
-	sr.Handle("/find_team_by_name", ApiAppHandler(findTeamByName)).Methods("POST")
-	sr.Handle("/find_teams", ApiAppHandler(findTeams)).Methods("POST")
-	sr.Handle("/email_teams", ApiAppHandler(emailTeams)).Methods("POST")
-	sr.Handle("/invite_members", ApiUserRequired(inviteMembers)).Methods("POST")
-	sr.Handle("/update_name", ApiUserRequired(updateTeamDisplayName)).Methods("POST")
-	sr.Handle("/update_valet_feature", ApiUserRequired(updateValetFeature)).Methods("POST")
-	sr.Handle("/me", ApiUserRequired(getMyTeam)).Methods("GET")
-	// These should be moved to the global admain console
-	sr.Handle("/import_team", ApiUserRequired(importTeam)).Methods("POST")
-	sr.Handle("/export_team", ApiUserRequired(exportTeam)).Methods("GET")
-}
+	BaseRoutes.Teams.Handle("/create", ApiUserRequired(createTeam)).Methods("POST")
+	BaseRoutes.Teams.Handle("/all", ApiUserRequired(getAll)).Methods("GET")
+	BaseRoutes.Teams.Handle("/all_team_listings", ApiUserRequired(GetAllTeamListings)).Methods("GET")
+	BaseRoutes.Teams.Handle("/get_invite_info", ApiAppHandler(getInviteInfo)).Methods("POST")
+	BaseRoutes.Teams.Handle("/find_team_by_name", ApiUserRequired(findTeamByName)).Methods("POST")
+	BaseRoutes.Teams.Handle("/name/{team_name:[A-Za-z0-9\\-]+}", ApiUserRequired(getTeamByName)).Methods("GET")
+	BaseRoutes.Teams.Handle("/members", ApiUserRequired(getMyTeamMembers)).Methods("GET")
+	BaseRoutes.Teams.Handle("/unread", ApiUserRequired(getMyTeamsUnread)).Methods("GET")
 
-func signupTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	if utils.Cfg.ServiceSettings.DisableEmailSignUp {
-		c.Err = model.NewAppError("signupTeam", "Team sign-up with email is disabled.", "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
+	BaseRoutes.NeedTeam.Handle("/me", ApiUserRequired(getMyTeam)).Methods("GET")
+	BaseRoutes.NeedTeam.Handle("/stats", ApiUserRequired(getTeamStats)).Methods("GET")
+	BaseRoutes.NeedTeam.Handle("/members/{offset:[0-9]+}/{limit:[0-9]+}", ApiUserRequired(getTeamMembers)).Methods("GET")
+	BaseRoutes.NeedTeam.Handle("/members/ids", ApiUserRequired(getTeamMembersByIds)).Methods("POST")
+	BaseRoutes.NeedTeam.Handle("/members/{user_id:[A-Za-z0-9]+}", ApiUserRequired(getTeamMember)).Methods("GET")
+	BaseRoutes.NeedTeam.Handle("/update", ApiUserRequired(updateTeam)).Methods("POST")
+	BaseRoutes.NeedTeam.Handle("/update_member_roles", ApiUserRequired(updateMemberRoles)).Methods("POST")
 
-	m := model.MapFromJson(r.Body)
-	email := strings.ToLower(strings.TrimSpace(m["email"]))
+	BaseRoutes.NeedTeam.Handle("/invite_members", ApiUserRequired(inviteMembers)).Methods("POST")
 
-	if len(email) == 0 {
-		c.SetInvalidParam("signupTeam", "email")
-		return
-	}
+	BaseRoutes.NeedTeam.Handle("/add_user_to_team", ApiUserRequired(addUserToTeam)).Methods("POST")
+	BaseRoutes.NeedTeam.Handle("/remove_user_from_team", ApiUserRequired(removeUserFromTeam)).Methods("POST")
 
-	if !isTreamCreationAllowed(c, email) {
-		return
-	}
-
-	subjectPage := NewServerTemplatePage("signup_team_subject")
-	subjectPage.Props["SiteURL"] = c.GetSiteURL()
-	bodyPage := NewServerTemplatePage("signup_team_body")
-	bodyPage.Props["SiteURL"] = c.GetSiteURL()
-	bodyPage.Props["TourUrl"] = utils.Cfg.TeamSettings.TourLink
-
-	props := make(map[string]string)
-	props["email"] = email
-	props["time"] = fmt.Sprintf("%v", model.GetMillis())
-
-	data := model.MapToJson(props)
-	hash := model.HashPassword(fmt.Sprintf("%v:%v", data, utils.Cfg.ServiceSettings.InviteSalt))
-
-	bodyPage.Props["Link"] = fmt.Sprintf("%s/signup_team_complete/?d=%s&h=%s", c.GetSiteURL(), url.QueryEscape(data), url.QueryEscape(hash))
-
-	if err := utils.SendMail(email, subjectPage.Render(), bodyPage.Render()); err != nil {
-		c.Err = err
-		return
-	}
-
-	if utils.Cfg.ServiceSettings.Mode == utils.MODE_DEV || utils.Cfg.EmailSettings.ByPassEmail {
-		m["follow_link"] = bodyPage.Props["Link"]
-	}
-
-	w.Header().Set("Access-Control-Allow-Origin", " *")
-	w.Write([]byte(model.MapToJson(m)))
-}
-
-func createTeamFromSSO(c *Context, w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	service := params["service"]
-
-	if !utils.IsServiceAllowed(service) {
-		c.SetInvalidParam("createTeamFromSSO", "service")
-		return
-	}
-
-	team := model.TeamFromJson(r.Body)
-
-	if team == nil {
-		c.SetInvalidParam("createTeamFromSSO", "team")
-		return
-	}
-
-	if !isTreamCreationAllowed(c, team.Email) {
-		return
-	}
-
-	team.PreSave()
-
-	team.Name = model.CleanTeamName(team.Name)
-
-	if err := team.IsValid(); err != nil {
-		c.Err = err
-		return
-	}
-
-	team.Id = ""
-
-	found := true
-	count := 0
-	for found {
-		if found = FindTeamByName(c, team.Name, "true"); c.Err != nil {
-			return
-		} else if found {
-			team.Name = team.Name + strconv.Itoa(count)
-			count += 1
-		}
-	}
-
-	team.AllowValet = utils.Cfg.TeamSettings.AllowValetDefault
-
-	if result := <-Srv.Store.Team().Save(team); result.Err != nil {
-		c.Err = result.Err
-		return
-	} else {
-		rteam := result.Data.(*model.Team)
-
-		if _, err := CreateDefaultChannels(c, rteam.Id); err != nil {
-			c.Err = nil
-			return
-		}
-
-		data := map[string]string{"follow_link": c.GetSiteURL() + "/" + rteam.Name + "/signup/" + service}
-		w.Write([]byte(model.MapToJson(data)))
-
-	}
-
-}
-
-func createTeamFromSignup(c *Context, w http.ResponseWriter, r *http.Request) {
-	if utils.Cfg.ServiceSettings.DisableEmailSignUp {
-		c.Err = model.NewAppError("createTeamFromSignup", "Team sign-up with email is disabled.", "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
-
-	teamSignup := model.TeamSignupFromJson(r.Body)
-
-	if teamSignup == nil {
-		c.SetInvalidParam("createTeam", "teamSignup")
-		return
-	}
-
-	props := model.MapFromJson(strings.NewReader(teamSignup.Data))
-	teamSignup.Team.Email = props["email"]
-	teamSignup.User.Email = props["email"]
-
-	teamSignup.Team.PreSave()
-
-	if err := teamSignup.Team.IsValid(); err != nil {
-		c.Err = err
-		return
-	}
-
-	if !isTreamCreationAllowed(c, teamSignup.Team.Email) {
-		return
-	}
-
-	teamSignup.Team.Id = ""
-
-	password := teamSignup.User.Password
-	teamSignup.User.PreSave()
-	teamSignup.User.TeamId = model.NewId()
-	if err := teamSignup.User.IsValid(); err != nil {
-		c.Err = err
-		return
-	}
-	teamSignup.User.Id = ""
-	teamSignup.User.TeamId = ""
-	teamSignup.User.Password = password
-
-	if !model.ComparePassword(teamSignup.Hash, fmt.Sprintf("%v:%v", teamSignup.Data, utils.Cfg.ServiceSettings.InviteSalt)) {
-		c.Err = model.NewAppError("createTeamFromSignup", "The signup link does not appear to be valid", "")
-		return
-	}
-
-	t, err := strconv.ParseInt(props["time"], 10, 64)
-	if err != nil || model.GetMillis()-t > 1000*60*60 { // one hour
-		c.Err = model.NewAppError("createTeamFromSignup", "The signup link has expired", "")
-		return
-	}
-
-	found := FindTeamByName(c, teamSignup.Team.Name, "true")
-	if c.Err != nil {
-		return
-	}
-
-	if found {
-		c.Err = model.NewAppError("createTeamFromSignup", "This URL is unavailable. Please try another.", "d="+teamSignup.Team.Name)
-		return
-	}
-
-	teamSignup.Team.AllowValet = utils.Cfg.TeamSettings.AllowValetDefault
-
-	if result := <-Srv.Store.Team().Save(&teamSignup.Team); result.Err != nil {
-		c.Err = result.Err
-		return
-	} else {
-		rteam := result.Data.(*model.Team)
-
-		if _, err := CreateDefaultChannels(c, rteam.Id); err != nil {
-			c.Err = nil
-			return
-		}
-
-		teamSignup.User.TeamId = rteam.Id
-		teamSignup.User.EmailVerified = true
-
-		ruser := CreateUser(c, rteam, &teamSignup.User)
-		if c.Err != nil {
-			return
-		}
-
-		if teamSignup.Team.AllowValet {
-			CreateValet(c, rteam)
-			if c.Err != nil {
-				return
-			}
-		}
-
-		InviteMembers(c, rteam, ruser, teamSignup.Invites)
-
-		teamSignup.Team = *rteam
-		teamSignup.User = *ruser
-
-		w.Write([]byte(teamSignup.ToJson()))
-	}
+	// These should be moved to the global admin console
+	BaseRoutes.NeedTeam.Handle("/import_team", ApiUserRequired(importTeam)).Methods("POST")
+	BaseRoutes.Teams.Handle("/add_user_to_team_from_invite", ApiUserRequiredMfa(addUserToTeamFromInvite)).Methods("POST")
 }
 
 func createTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 	team := model.TeamFromJson(r.Body)
-	rteam := CreateTeam(c, team)
-	if c.Err != nil {
+
+	if team == nil {
+		c.SetInvalidParam("createTeam", "team")
+		return
+	}
+
+	if !app.SessionHasPermissionTo(c.Session, model.PERMISSION_CREATE_TEAM) {
+		c.Err = model.NewAppError("createTeam", "api.team.is_team_creation_allowed.disabled.app_error", nil, "", http.StatusForbidden)
+		return
+	}
+
+	rteam, err := c.App.CreateTeamWithUser(team, c.Session.UserId)
+	if err != nil {
+		c.Err = err
 		return
 	}
 
 	w.Write([]byte(rteam.ToJson()))
 }
 
-func CreateTeam(c *Context, team *model.Team) *model.Team {
-	if utils.Cfg.ServiceSettings.DisableEmailSignUp {
-		c.Err = model.NewAppError("createTeam", "Team sign-up with email is disabled.", "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return nil
+func GetAllTeamListings(c *Context, w http.ResponseWriter, r *http.Request) {
+	var teams []*model.Team
+	var err *model.AppError
+
+	if teams, err = c.App.GetAllOpenTeams(); err != nil {
+		c.Err = err
+		return
 	}
 
-	if team == nil {
-		c.SetInvalidParam("createTeam", "team")
-		return nil
-	}
-
-	if !isTreamCreationAllowed(c, team.Email) {
-		return nil
-	}
-
-	if utils.Cfg.ServiceSettings.Mode != utils.MODE_DEV {
-		c.Err = model.NewAppError("CreateTeam", "The mode does not allow network creation without a valid invite", "")
-		return nil
-	}
-
-	if result := <-Srv.Store.Team().Save(team); result.Err != nil {
-		c.Err = result.Err
-		return nil
-	} else {
-		rteam := result.Data.(*model.Team)
-
-		if _, err := CreateDefaultChannels(c, rteam.Id); err != nil {
-			c.Err = err
-			return nil
+	m := make(map[string]*model.Team)
+	for _, v := range teams {
+		m[v.Id] = v
+		if !app.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM) {
+			m[v.Id].Sanitize()
 		}
-
-		if rteam.AllowValet {
-			CreateValet(c, rteam)
-			if c.Err != nil {
-				return nil
-			}
-		}
-
-		return rteam
 	}
+
+	w.Write([]byte(model.TeamMapToJson(m)))
 }
 
-func isTreamCreationAllowed(c *Context, email string) bool {
+// Gets all teams which the current user can has access to. If the user is a System Admin, this will be all teams
+// on the server. Otherwise, it will only be the teams of which the user is a member.
+func getAll(c *Context, w http.ResponseWriter, r *http.Request) {
+	var teams []*model.Team
+	var err *model.AppError
 
-	email = strings.ToLower(email)
-
-	if utils.Cfg.TeamSettings.DisableTeamCreation {
-		c.Err = model.NewAppError("isTreamCreationAllowed", "Team creation has been disabled. Please ask your systems administrator for details.", "")
-		return false
+	if c.App.HasPermissionTo(c.Session.UserId, model.PERMISSION_MANAGE_SYSTEM) {
+		teams, err = c.App.GetAllTeams()
+	} else {
+		teams, err = c.App.GetTeamsForUser(c.Session.UserId)
 	}
 
-	// commas and @ signs are optional
-	// can be in the form of "@corp.mattermost.com, mattermost.com mattermost.org" -> corp.mattermost.com mattermost.com mattermost.org
-	domains := strings.Fields(strings.TrimSpace(strings.ToLower(strings.Replace(strings.Replace(utils.Cfg.TeamSettings.RestrictCreationToDomains, "@", " ", -1), ",", " ", -1))))
+	if err != nil {
+		c.Err = err
+		return
+	}
 
-	matched := false
-	for _, d := range domains {
-		if strings.HasSuffix(email, "@"+d) {
-			matched = true
-			break
+	m := make(map[string]*model.Team)
+	for _, v := range teams {
+		m[v.Id] = v
+	}
+
+	w.Write([]byte(model.TeamMapToJson(m)))
+}
+
+func inviteMembers(c *Context, w http.ResponseWriter, r *http.Request) {
+	invites := model.InvitesFromJson(r.Body)
+
+	if utils.IsLicensed() && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_INVITE_USER) {
+		errorId := ""
+		if *utils.Cfg.TeamSettings.RestrictTeamInvite == model.PERMISSIONS_SYSTEM_ADMIN {
+			errorId = "api.team.invite_members.restricted_system_admin.app_error"
+		} else if *utils.Cfg.TeamSettings.RestrictTeamInvite == model.PERMISSIONS_TEAM_ADMIN {
+			errorId = "api.team.invite_members.restricted_team_admin.app_error"
+		}
+
+		c.Err = model.NewAppError("inviteMembers", errorId, nil, "", http.StatusForbidden)
+		return
+	}
+
+	if err := c.App.InviteNewUsersToTeam(invites.ToEmailList(), c.TeamId, c.Session.UserId); err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(invites.ToJson()))
+}
+
+func addUserToTeam(c *Context, w http.ResponseWriter, r *http.Request) {
+	params := model.MapFromJson(r.Body)
+	userId := params["user_id"]
+
+	if len(userId) != 26 {
+		c.SetInvalidParam("addUserToTeam", "user_id")
+		return
+	}
+
+	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_ADD_USER_TO_TEAM) {
+		c.SetPermissionError(model.PERMISSION_ADD_USER_TO_TEAM)
+		return
+	}
+
+	if _, err := c.App.AddUserToTeam(c.TeamId, userId, ""); err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(model.MapToJson(params)))
+}
+
+func removeUserFromTeam(c *Context, w http.ResponseWriter, r *http.Request) {
+	params := model.MapFromJson(r.Body)
+	userId := params["user_id"]
+
+	if len(userId) != 26 {
+		c.SetInvalidParam("removeUserFromTeam", "user_id")
+		return
+	}
+
+	if c.Session.UserId != userId {
+		if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_REMOVE_USER_FROM_TEAM) {
+			c.SetPermissionError(model.PERMISSION_REMOVE_USER_FROM_TEAM)
+			return
 		}
 	}
 
-	if len(utils.Cfg.TeamSettings.RestrictCreationToDomains) > 0 && !matched {
-		c.Err = model.NewAppError("isTreamCreationAllowed", "Email must be from a specific domain (e.g. @example.com). Please ask your systems administrator for details.", "")
-		return false
+	if err := c.App.RemoveUserFromTeam(c.TeamId, userId); err != nil {
+		c.Err = err
+		return
 	}
 
-	return true
+	w.Write([]byte(model.MapToJson(params)))
+}
+
+func addUserToTeamFromInvite(c *Context, w http.ResponseWriter, r *http.Request) {
+	params := model.MapFromJson(r.Body)
+	hash := params["hash"]
+	data := params["data"]
+	inviteId := params["invite_id"]
+
+	var team *model.Team
+	var err *model.AppError
+
+	if len(hash) > 0 {
+		team, err = c.App.AddUserToTeamByHash(c.Session.UserId, hash, data)
+	} else if len(inviteId) > 0 {
+		team, err = c.App.AddUserToTeamByInviteId(inviteId, c.Session.UserId)
+	} else {
+		c.Err = model.NewAppError("addUserToTeamFromInvite", "api.user.create_user.signup_link_invalid.app_error", nil, "", http.StatusBadRequest)
+		return
+	}
+
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	team.Sanitize()
+
+	w.Write([]byte(team.ToJson()))
 }
 
 func findTeamByName(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	m := model.MapFromJson(r.Body)
-
 	name := strings.ToLower(strings.TrimSpace(m["name"]))
-	all := strings.ToLower(strings.TrimSpace(m["all"]))
 
-	found := FindTeamByName(c, name, all)
-
-	if c.Err != nil {
-		return
-	}
+	found := c.App.FindTeamByName(name)
 
 	if found {
 		w.Write([]byte("true"))
@@ -348,295 +226,152 @@ func findTeamByName(c *Context, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func FindTeamByName(c *Context, name string, all string) bool {
+func getTeamByName(c *Context, w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	teamname := params["team_name"]
 
-	if name == "" || len(name) > 64 {
-		c.SetInvalidParam("findTeamByName", "domain")
-		return false
-	}
-
-	if model.IsReservedTeamName(name) {
-		c.Err = model.NewAppError("findTeamByName", "This URL is unavailable. Please try another.", "name="+name)
-		return false
-	}
-
-	if result := <-Srv.Store.Team().GetByName(name); result.Err != nil {
-		return false
-	} else {
-		return true
-	}
-
-	return false
-}
-
-func findTeams(c *Context, w http.ResponseWriter, r *http.Request) {
-
-	m := model.MapFromJson(r.Body)
-
-	email := strings.ToLower(strings.TrimSpace(m["email"]))
-
-	if email == "" {
-		c.SetInvalidParam("findTeam", "email")
-		return
-	}
-
-	if result := <-Srv.Store.Team().GetTeamsForEmail(email); result.Err != nil {
-		c.Err = result.Err
+	if team, err := c.App.GetTeamByName(teamname); err != nil {
+		c.Err = err
 		return
 	} else {
-		teams := result.Data.([]*model.Team)
-
-		s := make([]string, 0, len(teams))
-
-		for _, v := range teams {
-			s = append(s, v.Name)
+		if (!team.AllowOpenInvite || team.Type != model.TEAM_OPEN) && c.Session.GetTeamByTeamId(team.Id) == nil {
+			if !app.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM) {
+				c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+				return
+			}
 		}
 
-		w.Write([]byte(model.ArrayToJson(s)))
+		w.Write([]byte(team.ToJson()))
+		return
 	}
 }
 
-func emailTeams(c *Context, w http.ResponseWriter, r *http.Request) {
-
-	m := model.MapFromJson(r.Body)
-
-	email := strings.ToLower(strings.TrimSpace(m["email"]))
-
-	if email == "" {
-		c.SetInvalidParam("findTeam", "email")
-		return
-	}
-
-	subjectPage := NewServerTemplatePage("find_teams_subject")
-	subjectPage.Props["SiteURL"] = c.GetSiteURL()
-	bodyPage := NewServerTemplatePage("find_teams_body")
-	bodyPage.Props["SiteURL"] = c.GetSiteURL()
-
-	if result := <-Srv.Store.Team().GetTeamsForEmail(email); result.Err != nil {
-		c.Err = result.Err
+func getMyTeamMembers(c *Context, w http.ResponseWriter, r *http.Request) {
+	if len(c.Session.TeamMembers) > 0 {
+		w.Write([]byte(model.TeamMembersToJson(c.Session.TeamMembers)))
 	} else {
-		teams := result.Data.([]*model.Team)
-
-		// the template expects Props to be a map with team names as the keys and the team url as the value
-		props := make(map[string]string)
-		for _, team := range teams {
-			props[team.Name] = c.GetTeamURLFromTeam(team)
-		}
-		bodyPage.Props = props
-
-		if err := utils.SendMail(email, subjectPage.Render(), bodyPage.Render()); err != nil {
-			l4g.Error("An error occured while sending an email in emailTeams err=%v", err)
-		}
-
-		w.Write([]byte(model.MapToJson(m)))
-	}
-}
-
-func inviteMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	invites := model.InvitesFromJson(r.Body)
-	if len(invites.Invites) == 0 {
-		c.Err = model.NewAppError("Team.InviteMembers", "No one to invite.", "")
-		c.Err.StatusCode = http.StatusBadRequest
-		return
-	}
-
-	tchan := Srv.Store.Team().Get(c.Session.TeamId)
-	uchan := Srv.Store.User().Get(c.Session.UserId)
-
-	var team *model.Team
-	if result := <-tchan; result.Err != nil {
-		c.Err = result.Err
-		return
-	} else {
-		team = result.Data.(*model.Team)
-	}
-
-	var user *model.User
-	if result := <-uchan; result.Err != nil {
-		c.Err = result.Err
-		return
-	} else {
-		user = result.Data.(*model.User)
-	}
-
-	var invNum int64 = 0
-	for i, invite := range invites.Invites {
-		if result := <-Srv.Store.User().GetByEmail(c.Session.TeamId, invite["email"]); result.Err == nil || result.Err.Message != "We couldn't find the existing account" {
-			invNum = int64(i)
-			c.Err = model.NewAppError("invite_members", "This person is already on your team", strconv.FormatInt(invNum, 10))
+		if members, err := c.App.GetTeamMembersForUser(c.Session.UserId); err != nil {
+			c.Err = err
 			return
-		}
-	}
-
-	ia := make([]string, len(invites.Invites))
-	for _, invite := range invites.Invites {
-		ia = append(ia, invite["email"])
-	}
-
-	InviteMembers(c, team, user, ia)
-
-	w.Write([]byte(invites.ToJson()))
-}
-
-func InviteMembers(c *Context, team *model.Team, user *model.User, invites []string) {
-	for _, invite := range invites {
-		if len(invite) > 0 {
-
-			sender := user.GetDisplayName()
-
-			senderRole := ""
-			if model.IsInRole(user.Roles, model.ROLE_TEAM_ADMIN) || model.IsInRole(user.Roles, model.ROLE_SYSTEM_ADMIN) {
-				senderRole = "administrator"
-			} else {
-				senderRole = "member"
-			}
-
-			subjectPage := NewServerTemplatePage("invite_subject")
-			subjectPage.Props["SiteURL"] = c.GetSiteURL()
-			subjectPage.Props["SenderName"] = sender
-			subjectPage.Props["TeamDisplayName"] = team.DisplayName
-
-			bodyPage := NewServerTemplatePage("invite_body")
-			bodyPage.Props["SiteURL"] = c.GetSiteURL()
-			bodyPage.Props["TeamDisplayName"] = team.DisplayName
-			bodyPage.Props["SenderName"] = sender
-			bodyPage.Props["SenderStatus"] = senderRole
-			bodyPage.Props["Email"] = invite
-			props := make(map[string]string)
-			props["email"] = invite
-			props["id"] = team.Id
-			props["display_name"] = team.DisplayName
-			props["name"] = team.Name
-			props["time"] = fmt.Sprintf("%v", model.GetMillis())
-			data := model.MapToJson(props)
-			hash := model.HashPassword(fmt.Sprintf("%v:%v", data, utils.Cfg.ServiceSettings.InviteSalt))
-			bodyPage.Props["Link"] = fmt.Sprintf("%s/signup_user_complete/?d=%s&h=%s", c.GetSiteURL(), url.QueryEscape(data), url.QueryEscape(hash))
-
-			if utils.Cfg.ServiceSettings.Mode == utils.MODE_DEV {
-				l4g.Info("sending invitation to %v %v", invite, bodyPage.Props["Link"])
-			}
-
-			if err := utils.SendMail(invite, subjectPage.Render(), bodyPage.Render()); err != nil {
-				l4g.Error("Failed to send invite email successfully err=%v", err)
-			}
+		} else {
+			w.Write([]byte(model.TeamMembersToJson(members)))
 		}
 	}
 }
 
-func updateTeamDisplayName(c *Context, w http.ResponseWriter, r *http.Request) {
+func getMyTeamsUnread(c *Context, w http.ResponseWriter, r *http.Request) {
+	teamId := r.URL.Query().Get("id")
 
-	props := model.MapFromJson(r.Body)
-
-	new_name := props["new_name"]
-	if len(new_name) == 0 {
-		c.SetInvalidParam("updateTeamDisplayName", "new_name")
-		return
-	}
-
-	teamId := props["team_id"]
-	if len(teamId) > 0 && len(teamId) != 26 {
-		c.SetInvalidParam("updateTeamDisplayName", "team_id")
-		return
-	} else if len(teamId) == 0 {
-		teamId = c.Session.TeamId
-	}
-
-	if !c.HasPermissionsToTeam(teamId, "updateTeamDisplayName") {
-		return
-	}
-
-	if !model.IsInRole(c.Session.Roles, model.ROLE_TEAM_ADMIN) {
-		c.Err = model.NewAppError("updateTeamDisplayName", "You do not have the appropriate permissions", "userId="+c.Session.UserId)
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
-
-	if result := <-Srv.Store.Team().UpdateDisplayName(new_name, c.Session.TeamId); result.Err != nil {
-		c.Err = result.Err
-		return
-	}
-
-	w.Write([]byte(model.MapToJson(props)))
-}
-
-func updateValetFeature(c *Context, w http.ResponseWriter, r *http.Request) {
-
-	props := model.MapFromJson(r.Body)
-
-	allowValetStr := props["allow_valet"]
-	if len(allowValetStr) == 0 {
-		c.SetInvalidParam("updateValetFeature", "allow_valet")
-		return
-	}
-
-	allowValet := allowValetStr == "true"
-
-	teamId := props["team_id"]
-	if len(teamId) > 0 && len(teamId) != 26 {
-		c.SetInvalidParam("updateValetFeature", "team_id")
-		return
-	} else if len(teamId) == 0 {
-		teamId = c.Session.TeamId
-	}
-
-	tchan := Srv.Store.Team().Get(teamId)
-
-	if !c.HasPermissionsToTeam(teamId, "updateValetFeature") {
-		return
-	}
-
-	if !model.IsInRole(c.Session.Roles, model.ROLE_TEAM_ADMIN) {
-		c.Err = model.NewAppError("updateValetFeature", "You do not have the appropriate permissions", "userId="+c.Session.UserId)
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
-
-	var team *model.Team
-	if tResult := <-tchan; tResult.Err != nil {
-		c.Err = tResult.Err
+	if unreads, err := c.App.GetTeamsUnreadForUser(teamId, c.Session.UserId); err != nil {
+		c.Err = err
 		return
 	} else {
-		team = tResult.Data.(*model.Team)
+		w.Write([]byte(model.TeamsUnreadToJson(unreads)))
 	}
+}
 
-	team.AllowValet = allowValet
+func updateTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 
-	if result := <-Srv.Store.Team().Update(team); result.Err != nil {
-		c.Err = result.Err
+	team := model.TeamFromJson(r.Body)
+	if team == nil {
+		c.SetInvalidParam("updateTeam", "team")
 		return
 	}
 
-	w.Write([]byte(model.MapToJson(props)))
+	team.Id = c.TeamId
+
+	if !app.SessionHasPermissionToTeam(c.Session, team.Id, model.PERMISSION_MANAGE_TEAM) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_TEAM)
+		return
+	}
+
+	var err *model.AppError
+	var updatedTeam *model.Team
+
+	updatedTeam, err = c.App.UpdateTeam(team)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(updatedTeam.ToJson()))
+}
+
+func updateMemberRoles(c *Context, w http.ResponseWriter, r *http.Request) {
+	props := model.MapFromJson(r.Body)
+
+	userId := props["user_id"]
+	if len(userId) != 26 {
+		c.SetInvalidParam("updateMemberRoles", "user_id")
+		return
+	}
+
+	teamId := c.TeamId
+
+	newRoles := props["new_roles"]
+	if !(model.IsValidUserRoles(newRoles)) {
+		c.SetInvalidParam("updateMemberRoles", "new_roles")
+		return
+	}
+
+	if !app.SessionHasPermissionToTeam(c.Session, teamId, model.PERMISSION_MANAGE_TEAM_ROLES) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_TEAM_ROLES)
+		return
+	}
+
+	if _, err := c.App.UpdateTeamMemberRoles(teamId, userId, newRoles); err != nil {
+		c.Err = err
+		return
+	}
+
+	rdata := map[string]string{}
+	rdata["status"] = "ok"
+	w.Write([]byte(model.MapToJson(rdata)))
 }
 
 func getMyTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 
-	if len(c.Session.TeamId) == 0 {
+	if len(c.TeamId) == 0 {
 		return
 	}
 
-	if result := <-Srv.Store.Team().Get(c.Session.TeamId); result.Err != nil {
-		c.Err = result.Err
+	if team, err := c.App.GetTeam(c.TeamId); err != nil {
+		c.Err = err
 		return
-	} else if HandleEtag(result.Data.(*model.Team).Etag(), w, r) {
+	} else if HandleEtag(team.Etag(), "Get My Team", w, r) {
 		return
 	} else {
-		w.Header().Set(model.HEADER_ETAG_SERVER, result.Data.(*model.Team).Etag())
-		w.Header().Set("Expires", "-1")
-		w.Write([]byte(result.Data.(*model.Team).ToJson()))
+		w.Header().Set(model.HEADER_ETAG_SERVER, team.Etag())
+		w.Write([]byte(team.ToJson()))
 		return
 	}
 }
 
+func getTeamStats(c *Context, w http.ResponseWriter, r *http.Request) {
+	if c.Session.GetTeamByTeamId(c.TeamId) == nil {
+		if !app.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+			return
+		}
+	}
+
+	stats, err := c.App.GetTeamStats(c.TeamId)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	w.Write([]byte(stats.ToJson()))
+}
+
 func importTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.HasPermissionsToTeam(c.Session.TeamId, "import") || !c.IsTeamAdmin(c.Session.UserId) {
-		c.Err = model.NewAppError("importTeam", "Only a team admin can import data.", "userId="+c.Session.UserId)
-		c.Err.StatusCode = http.StatusForbidden
+	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_IMPORT_TEAM) {
+		c.SetPermissionError(model.PERMISSION_IMPORT_TEAM)
 		return
 	}
 
 	if err := r.ParseMultipartForm(10000000); err != nil {
-		c.Err = model.NewAppError("importTeam", "Could not parse multipart form", err.Error())
+		c.Err = model.NewAppError("importTeam", "api.team.import_team.parse.app_error", nil, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -645,28 +380,24 @@ func importTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	fileSizeStr, ok := r.MultipartForm.Value["filesize"]
 	if !ok {
-		c.Err = model.NewAppError("importTeam", "Filesize unavilable", "")
-		c.Err.StatusCode = http.StatusBadRequest
+		c.Err = model.NewAppError("importTeam", "api.team.import_team.unavailable.app_error", nil, "", http.StatusBadRequest)
 		return
 	}
 
 	fileSize, err := strconv.ParseInt(fileSizeStr[0], 10, 64)
 	if err != nil {
-		c.Err = model.NewAppError("importTeam", "Filesize not an integer", "")
-		c.Err.StatusCode = http.StatusBadRequest
+		c.Err = model.NewAppError("importTeam", "api.team.import_team.integer.app_error", nil, "", http.StatusBadRequest)
 		return
 	}
 
 	fileInfoArray, ok := r.MultipartForm.File["file"]
 	if !ok {
-		c.Err = model.NewAppError("importTeam", "No file under 'file' in request", "")
-		c.Err.StatusCode = http.StatusBadRequest
+		c.Err = model.NewAppError("importTeam", "api.team.import_team.no_file.app_error", nil, "", http.StatusBadRequest)
 		return
 	}
 
 	if len(fileInfoArray) <= 0 {
-		c.Err = model.NewAppError("importTeam", "Empty array under 'file' in request", "")
-		c.Err.StatusCode = http.StatusBadRequest
+		c.Err = model.NewAppError("importTeam", "api.team.import_team.array.app_error", nil, "", http.StatusBadRequest)
 		return
 	}
 
@@ -675,8 +406,7 @@ func importTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 	fileData, err := fileInfo.Open()
 	defer fileData.Close()
 	if err != nil {
-		c.Err = model.NewAppError("importTeam", "Could not open file", err.Error())
-		c.Err.StatusCode = http.StatusBadRequest
+		c.Err = model.NewAppError("importTeam", "api.team.import_team.open.app_error", nil, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -684,7 +414,7 @@ func importTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 	switch importFrom {
 	case "slack":
 		var err *model.AppError
-		if err, log = SlackImport(fileData, fileSize, c.Session.TeamId); err != nil {
+		if err, log = c.App.SlackImport(fileData, fileSize, c.TeamId); err != nil {
 			c.Err = err
 			c.Err.StatusCode = http.StatusBadRequest
 		}
@@ -692,24 +422,110 @@ func importTeam(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", "attachment; filename=MattermostImportLog.txt")
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, "MattermostImportLog.txt", time.Now(), bytes.NewReader(log.Bytes()))
+	if c.Err != nil {
+		w.WriteHeader(c.Err.StatusCode)
+	}
+	io.Copy(w, bytes.NewReader(log.Bytes()))
+	//http.ServeContent(w, r, "MattermostImportLog.txt", time.Now(), bytes.NewReader(log.Bytes()))
 }
 
-func exportTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.HasPermissionsToTeam(c.Session.TeamId, "export") || !c.IsTeamAdmin(c.Session.UserId) {
-		c.Err = model.NewAppError("exportTeam", "Only a team admin can export data.", "userId="+c.Session.UserId)
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
+func getInviteInfo(c *Context, w http.ResponseWriter, r *http.Request) {
+	m := model.MapFromJson(r.Body)
+	inviteId := m["invite_id"]
 
-	options := ExportOptionsFromJson(r.Body)
-
-	if link, err := ExportToFile(options); err != nil {
+	if team, err := c.App.GetTeamByInviteId(inviteId); err != nil {
 		c.Err = err
 		return
 	} else {
+		if !(team.Type == model.TEAM_OPEN) {
+			c.Err = model.NewAppError("getInviteInfo", "api.team.get_invite_info.not_open_team", nil, "id="+inviteId, http.StatusBadRequest)
+			return
+		}
+
 		result := map[string]string{}
-		result["link"] = link
+		result["display_name"] = team.DisplayName
+		result["description"] = team.Description
+		result["name"] = team.Name
+		result["id"] = team.Id
 		w.Write([]byte(model.MapToJson(result)))
+	}
+}
+
+func getTeamMembers(c *Context, w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+
+	offset, err := strconv.Atoi(params["offset"])
+	if err != nil {
+		c.SetInvalidParam("getTeamMembers", "offset")
+		return
+	}
+
+	limit, err := strconv.Atoi(params["limit"])
+	if err != nil {
+		c.SetInvalidParam("getTeamMembers", "limit")
+		return
+	}
+
+	if c.Session.GetTeamByTeamId(c.TeamId) == nil {
+		if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_SYSTEM) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+			return
+		}
+	}
+
+	if members, err := c.App.GetTeamMembers(c.TeamId, offset, limit); err != nil {
+		c.Err = err
+		return
+	} else {
+		w.Write([]byte(model.TeamMembersToJson(members)))
+		return
+	}
+}
+
+func getTeamMember(c *Context, w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+
+	userId := params["user_id"]
+	if len(userId) < 26 {
+		c.SetInvalidParam("getTeamMember", "user_id")
+		return
+	}
+
+	if c.Session.GetTeamByTeamId(c.TeamId) == nil {
+		if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_SYSTEM) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+			return
+		}
+	}
+
+	if member, err := c.App.GetTeamMember(c.TeamId, userId); err != nil {
+		c.Err = err
+		return
+	} else {
+		w.Write([]byte(member.ToJson()))
+		return
+	}
+}
+
+func getTeamMembersByIds(c *Context, w http.ResponseWriter, r *http.Request) {
+	userIds := model.ArrayFromJson(r.Body)
+	if len(userIds) == 0 {
+		c.SetInvalidParam("getTeamMembersByIds", "user_ids")
+		return
+	}
+
+	if c.Session.GetTeamByTeamId(c.TeamId) == nil {
+		if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_SYSTEM) {
+			c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
+			return
+		}
+	}
+
+	if members, err := c.App.GetTeamMembersByIds(c.TeamId, userIds); err != nil {
+		c.Err = err
+		return
+	} else {
+		w.Write([]byte(model.TeamMembersToJson(members)))
+		return
 	}
 }

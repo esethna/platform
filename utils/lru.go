@@ -14,13 +14,28 @@ import (
 	"time"
 )
 
+// Caching Interface
+type ObjectCache interface {
+	AddWithExpiresInSecs(key, value interface{}, expireAtSecs int64) bool
+	AddWithDefaultExpires(key, value interface{}) bool
+	Purge()
+	Get(key interface{}) (value interface{}, ok bool)
+	Remove(key interface{})
+	Len() int
+	Name() string
+	GetInvalidateClusterEvent() string
+}
+
 // Cache is a thread-safe fixed size LRU cache.
 type Cache struct {
-	size      int
-	evictList *list.List
-	items     map[interface{}]*list.Element
-	lock      sync.RWMutex
-	onEvicted func(key interface{}, value interface{})
+	size                   int
+	evictList              *list.List
+	items                  map[interface{}]*list.Element
+	lock                   sync.RWMutex
+	onEvicted              func(key interface{}, value interface{})
+	name                   string
+	defaultExpiry          int64
+	invalidateClusterEvent string
 }
 
 // entry is used to hold a value in the evictList
@@ -38,7 +53,7 @@ func NewLru(size int) *Cache {
 
 func NewLruWithEvict(size int, onEvicted func(key interface{}, value interface{})) (*Cache, error) {
 	if size <= 0 {
-		return nil, errors.New("Must provide a positive size")
+		return nil, errors.New(T("utils.iru.with_evict"))
 	}
 	c := &Cache{
 		size:      size,
@@ -47,6 +62,14 @@ func NewLruWithEvict(size int, onEvicted func(key interface{}, value interface{}
 		onEvicted: onEvicted,
 	}
 	return c, nil
+}
+
+func NewLruWithParams(size int, name string, defaultExpiry int64, invalidateClusterEvent string) *Cache {
+	lru := NewLru(size)
+	lru.name = name
+	lru.defaultExpiry = defaultExpiry
+	lru.invalidateClusterEvent = invalidateClusterEvent
+	return lru
 }
 
 // Purge is used to completely clear the cache
@@ -68,7 +91,11 @@ func (c *Cache) Add(key, value interface{}) bool {
 	return c.AddWithExpiresInSecs(key, value, 0)
 }
 
-// Add adds a value to the cache.  Returns true if an eviction occured.
+func (c *Cache) AddWithDefaultExpires(key, value interface{}) bool {
+	return c.AddWithExpiresInSecs(key, value, c.defaultExpiry)
+}
+
+// Add adds a value to the cache.  Returns true if an eviction occurred.
 func (c *Cache) AddWithExpiresInSecs(key, value interface{}, expireAtSecs int64) bool {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -157,6 +184,14 @@ func (c *Cache) Len() int {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.evictList.Len()
+}
+
+func (c *Cache) Name() string {
+	return c.name
+}
+
+func (c *Cache) GetInvalidateClusterEvent() string {
+	return c.invalidateClusterEvent
 }
 
 // removeOldest removes the oldest item from the cache.

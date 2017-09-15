@@ -2,11 +2,30 @@
 logs
 .DS_Store
 node_modules
-dist
+/dist
+/webapp/dist
+jobserver
 npm-debug.log
+webapp/yarn-error.log
+mattermost.mattermost-license
+config/mattermost.mattermost-license
+config/config.json
 
-bundle*.js
+web/static/js/bundle*.js
+web/static/js/bundle*.js.map
+web/static/js/libs*.js
 
+config/active.dat
+config/config.json
+/plugins
+
+# Enteprise imports file
+imports/imports.go
+
+# Build Targets
+.prebuild
+.npminstall
+.yarninstall
 
 # Compiled Object files, Static and Dynamic libs (Shared Objects)
 *.o
@@ -16,6 +35,7 @@ bundle*.js
 # Folders
 _obj
 _test
+.vscode
 
 # Architecture specific extensions/prefixes
 [568vq].out
@@ -36,8 +56,15 @@ _testmain.go
 *mattermost.log
 *npm-debug.log*
 
+.tmp
+
 # Vim temporary files
-*.swp
+[._]*.s[a-w][a-z]
+[._]s[a-w][a-z]
+*.un~
+Session.vim
+.netrwhist
+*~
 
 # Build files
 *bundle.js
@@ -49,8 +76,21 @@ web/sass-files/sass/.sass-cache/
 
 # Default local file storage
 data/*
+webapp/data/*
 api/data/*
+api4/data/*
+
+enterprise
+
+cover.out
+ecover.out
+*.test
+webapp/coverage
 
 .agignore
 .ctags
 tags
+.idea
+
+debug
+client

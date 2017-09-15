@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -83,5 +83,33 @@ func TestPostIsValid(t *testing.T) {
 func TestPostPreSave(t *testing.T) {
 	o := Post{Message: "test"}
 	o.PreSave()
+
+	if o.CreateAt == 0 {
+		t.Fatal("should be set")
+	}
+
+	past := GetMillis() - 1
+	o = Post{Message: "test", CreateAt: past}
+	o.PreSave()
+
+	if o.CreateAt > past {
+		t.Fatal("should not be updated")
+	}
+
 	o.Etag()
+}
+
+func TestPostIsSystemMessage(t *testing.T) {
+	post1 := Post{Message: "test_1"}
+	post1.PreSave()
+
+	if post1.IsSystemMessage() {
+		t.Fatalf("TestPostIsSystemMessage failed, expected post1.IsSystemMessage() to be false")
+	}
+
+	post2 := Post{Message: "test_2", Type: POST_JOIN_LEAVE}
+	post2.PreSave()
+	if !post2.IsSystemMessage() {
+		t.Fatalf("TestPostIsSystemMessage failed, expected post2.IsSystemMessage() to be true")
+	}
 }

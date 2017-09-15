@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	MAX_FILE_SIZE = 50000000 // 50 MB
+	MaxImageSize = 6048 * 4032 // 24 megapixels, roughly 36MB as a raw image
 )
 
 var (
@@ -18,8 +18,8 @@ var (
 )
 
 type FileUploadResponse struct {
-	Filenames []string `json:"filenames"`
-	ClientIds []string `json:"client_ids"`
+	FileInfos []*FileInfo `json:"file_infos"`
+	ClientIds []string    `json:"client_ids"`
 }
 
 func FileUploadResponseFromJson(data io.Reader) *FileUploadResponse {

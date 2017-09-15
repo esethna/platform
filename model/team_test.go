@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -45,7 +45,7 @@ func TestTeamIsValid(t *testing.T) {
 		t.Fatal("should be invalid")
 	}
 
-	o.Email = "corey@hulen.com"
+	o.Email = "corey+test@hulen.com"
 	o.DisplayName = strings.Repeat("01234567890", 20)
 	if err := o.IsValid(); err == nil {
 		t.Fatal("should be invalid")
@@ -84,11 +84,11 @@ var domains = []struct {
 	{"spin-punch-", false},
 	{"spin_punch", false},
 	{"a", false},
-	{"aa", false},
-	{"aaa", false},
+	{"aa", true},
+	{"aaa", true},
 	{"aaa-999b", true},
 	{"b00b", true},
-	{"b))b", false},
+	{"b)", false},
 	{"test", true},
 }
 
@@ -104,8 +104,6 @@ var tReservedDomains = []struct {
 	value    string
 	expected bool
 }{
-	{"test-hello", true},
-	{"test", true},
 	{"admin", true},
 	{"Admin-punch", true},
 	{"spin-punch-admin", false},
@@ -120,15 +118,14 @@ func TestReservedTeamName(t *testing.T) {
 }
 
 func TestCleanTeamName(t *testing.T) {
-	if CleanTeamName("Jimbo's Team") != "jimbos-team" {
+	if CleanTeamName("Jimbo's Admin") != "jimbos-admin" {
 		t.Fatal("didn't clean name properly")
 	}
-	if len(CleanTeamName("Test")) != 26 {
+
+	if CleanTeamName("Admin Really cool") != "really-cool" {
 		t.Fatal("didn't clean name properly")
 	}
-	if CleanTeamName("Team Really cool") != "really-cool" {
-		t.Fatal("didn't clean name properly")
-	}
+
 	if CleanTeamName("super-duper-guys") != "super-duper-guys" {
 		t.Fatal("didn't clean name properly")
 	}

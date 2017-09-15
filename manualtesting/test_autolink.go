@@ -1,11 +1,14 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package manualtesting
 
 import (
-	l4g "code.google.com/p/log4go"
-	"github.com/mattermost/platform/model"
+	"net/http"
+
+	l4g "github.com/alecthomas/log4go"
+	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/utils"
 )
 
 const LINK_POST_TEXT = `
@@ -19,11 +22,11 @@ http://www.google.com.pk/url?sa=t&rct=j&q=&esrc=s&source=web&cd=4&cad=rja&uact=8
 https://medium.com/@slackhq/11-useful-tips-for-getting-the-most-of-slack-5dfb3d1af77
 `
 
-func testAutoLink(env TestEnviroment) *model.AppError {
-	l4g.Info("Manual Auto Link Test")
+func testAutoLink(env TestEnvironment) *model.AppError {
+	l4g.Info(utils.T("manaultesting.test_autolink.info"))
 	channelID, err := getChannelID(model.DEFAULT_CHANNEL, env.CreatedTeamId, env.CreatedUserId)
 	if err != true {
-		return model.NewAppError("/manualtest", "Unable to get channels", "")
+		return model.NewAppError("/manualtest", "manaultesting.test_autolink.unable.app_error", nil, "", http.StatusInternalServerError)
 	}
 
 	post := &model.Post{
